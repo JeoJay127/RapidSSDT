@@ -1,0 +1,121 @@
+//  ssdt_category.dart 
+//  Created by JeoJay127 
+//
+import 'package:rapidssdt/utils/ssdttool/table.dart';
+
+class SsdtCategory {
+  static const patchCategories = [
+    {
+      'name': '核心补丁',
+      'remark': '系统正常启动和电源管理必需的基础补丁',
+      'actions': [
+        ACPITable.ssdtHPET,
+        ACPITable.ssdtECUSBXDesktop,
+        ACPITable.ssdtECUSBXLaptop,
+        ACPITable.ssdtECDesktop,
+        ACPITable.ssdtECLaptop,
+        ACPITable.ssdtUSBX,
+        ACPITable.ssdtPLUG,
+        ACPITable.ssdtPMC,
+        ACPITable.ssdtAWAC,
+        ACPITable.ssdtRTC0RANGE,
+      ],
+    },
+    {
+      'name': '功能补丁',
+      'remark': '提供额外功能或修复特性问题的补丁',
+      'actions': [
+        ACPITable.ssdtPNLF,
+        ACPITable.ssdtALS0,
+        ACPITable.ssdtXOSI,
+        ACPITable.ssdtRHUB,
+        ACPITable.ssdtBridge,
+        ACPITable.ssdtDMAR,
+        ACPITable.ssdtSBUSMCHC,
+        ACPITable.ssdtIMEI,
+        ACPITable.ssdtFixShutdown,
+        ACPITable.ssdtGPRW,
+        ACPITable.ssdtUPRW,
+        ACPITable.ssdtFACP,
+        ACPITable.ssdtRMNE,
+        ACPITable.ssdtGPI0,
+      ],
+    },
+    {
+      'name': '设备补丁',
+      'remark': '针对显卡硬件的补丁',
+      'actions': [
+        ACPITable.ssdtGPUSPOOF,
+        ACPITable.ssdtPCIDISABLE,
+      ],
+    },
+    {
+      'name': '专用补丁',
+      'remark': '仅在特定主板或架构需要的补丁',
+      'actions': [
+        ACPITable.ssdtIMEI,
+        ACPITable.ssdtUNC,
+        ACPITable.ssdtRTC0RANGE,
+        ACPITable.ssdtCPUR,
+      ],
+    },
+    {
+      'name': '睡眠补丁',
+      'remark': '非必需，用于修复睡眠问题',
+      'actions': [
+        ACPITable.checkSystemState,
+        ACPITable.checkAOAC,
+        ACPITable.ssdtGPRW,
+        ACPITable.ssdtUPRW,
+        ACPITable.ssdtLID,
+        ACPITable.ssdtWakeScreen,
+        ACPITable.ssdtLED,
+        ACPITable.ssdtS3Disable,
+        ACPITable.ssdtPWRB,
+        ACPITable.ssdtSLPB,
+      ],
+    },
+    {
+      'name': '辅助补丁',
+      'remark': '非必需，但可以补全ACPI结构或增强兼容性',
+      'actions': [
+        ACPITable.ssdtDTGP,
+        ACPITable.ssdtDMAC,
+        ACPITable.ssdtMEM2,
+      ],
+    },
+    {
+      'name': '预制补丁',
+      'actions': [
+        ACPITable.ssdtECDesktop,
+        ACPITable.ssdtECLaptop,
+        ACPITable.ssdtECUSBXDesktop,
+        ACPITable.ssdtECUSBXLaptop,
+        ACPITable.ssdtPLUG,
+        ACPITable.ssdtPLUGALT,
+        ACPITable.ssdtAWAC,
+        ACPITable.ssdtPMC,
+        ACPITable.ssdtPNLF,
+        ACPITable.ssdtIMEI,
+        ACPITable.ssdtXOSI,
+        ACPITable.ssdtALS0,
+        ACPITable.ssdtCPUR,
+        ACPITable.ssdtRHUB,
+        ACPITable.ssdtUNC,
+        ACPITable.ssdtRTC0RANGE,
+        ACPITable.ssdtFixShutdown,
+        ACPITable.ssdtSBUSMCHC,
+        ACPITable.ssdtRMNE,
+        ACPITable.ssdtGPI0,
+        ACPITable.ssdtS3Disable,
+        ACPITable.ssdtGPRW,
+        ACPITable.ssdtUPRW,
+        ACPITable.ssdtDTGP,
+        ACPITable.ssdtDMAC,
+        ACPITable.ssdtPWRB,
+        ACPITable.ssdtSLPB,
+        ACPITable.ssdtMEM2,
+      ],
+    },
+  ];
+}

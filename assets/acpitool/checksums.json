@@ -1,0 +1,11 @@
+{
+"linux/acpidump": "0fa000ab3698944941ee716da4bafabfbcbae246b3ea5a8b237e10d4e4a270e7",
+"linux/iasl": "b68754b0ef2d968ab973027262650f8eeb8ac3351f4fb36c2ece22448b4a3025",
+"linux/iasl-legacy": "a5c1a240e9609e11d23811974b8491e2b278028f92c51922bbe947716a6968b0",
+"macos/iasl": "d7880cdde7ce17a9bb15b5b76e129778f61a8a0ba0bcc8edb49624d05112b879",
+"macos/iasl-legacy": "929d116775fac7ba0e66c1b3b00c9854fe251691389d3c07ea5d7ef6a2aca47f",
+"macos/patchmatic": "ffdac7cfd5546afbeffbbb7d1270a03ca0cc3f200a538294dc808b45d2d30d20",
+"windows/iasl.exe": "908e4f3334ffb724fbf63a92dc9dd715b2ba0bdf5d8083ee8d9caf1a3f3bbd75",
+"windows/acpidump.exe": "447aa55eda951b16a1a29120930671d401e28e58bc38e66d77b302706803f677",
+"windows/iasl-legacy.exe": "a88662eebd751c7914c9c5ab36656d386a1fdc51822a20009dc27c34e13bed47"
+}
