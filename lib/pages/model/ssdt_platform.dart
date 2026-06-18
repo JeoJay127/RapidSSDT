@@ -1,5 +1,5 @@
-//  ssdt_platform.dart 
-//  Created by JeoJay127 
+//  ssdt_platform.dart
+//  Created by JeoJay127
 //
 // ignore_for_file: non_constant_identifier_names, constant_identifier_names
 import 'package:rapidssdt/utils/ssdttool/table.dart';
@@ -527,17 +527,17 @@ class SsdtPlatform {
   static Map<String, Map<String, dynamic>> platform_intel_hedt = {
     '1代-Nehalem&Westmere-X58平台': {
       'basic': [ACPITable.ssdtECDesktop],
-      'recommend': [ACPITable.ssdtHPET],
+      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtAPIC],
       'optional': optional_sstds_intel_hedt,
     },
     '2代-Sandy Bridge-E-X79平台': {
       'basic': [ACPITable.ssdtECDesktop, ACPITable.ssdtUNC],
-      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtDMAR],
+      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtAPIC, ACPITable.ssdtDMAR],
       'optional': optional_sstds_intel_hedt,
     },
     '3代-Ivy Bridge-E-X79平台': {
       'basic': [ACPITable.ssdtECDesktop, ACPITable.ssdtUNC],
-      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtDMAR],
+      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtAPIC, ACPITable.ssdtDMAR],
       'optional': optional_sstds_intel_hedt,
     },
     '4代-Haswell-E-X99平台': {
@@ -547,7 +547,7 @@ class SsdtPlatform {
         ACPITable.ssdtRTC0RANGE,
         ACPITable.ssdtUNC,
       ],
-      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtDMAR],
+      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtAPIC, ACPITable.ssdtDMAR],
       'optional': optional_sstds_intel_hedt,
     },
     '5代-Broadwell-E-X99平台': {
@@ -557,7 +557,7 @@ class SsdtPlatform {
         ACPITable.ssdtRTC0RANGE,
         ACPITable.ssdtUNC,
       ],
-      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtDMAR],
+      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtAPIC, ACPITable.ssdtDMAR],
       'optional': optional_sstds_intel_hedt,
     },
     '6代-Skylake-X&W-X299平台': {
@@ -566,7 +566,7 @@ class SsdtPlatform {
         ACPITable.ssdtPLUG,
         ACPITable.ssdtRTC0RANGE,
       ],
-      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtDMAR],
+      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtAPIC, ACPITable.ssdtDMAR],
       'optional': optional_sstds_intel_hedt,
     },
     '10代-Cascade Lake-X&W-X599平台': {
@@ -575,7 +575,7 @@ class SsdtPlatform {
         ACPITable.ssdtPLUG,
         ACPITable.ssdtRTC0RANGE,
       ],
-      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtDMAR],
+      'recommend': [ACPITable.ssdtHPET, ACPITable.ssdtAPIC, ACPITable.ssdtDMAR],
       'optional': optional_sstds_intel_hedt,
     },
   };

@@ -1,5 +1,5 @@
-//  ssdt.dart 
-//  Created by JeoJay127 
+//  ssdt.dart
+//  Created by JeoJay127
 //
 import 'dart:io';
 import 'package:flutter/foundation.dart';
@@ -27,6 +27,8 @@ class SSDT {
 
   String outputFolder = 'Results';
   ACPIMatchMode? _lastACPIMatchMode = ACPIMatchMode.leastStrict;
+  int _plistBatchDepth = 0;
+  final Map<String, Map<String, dynamic>> _batchedPlists = {};
 
   /// 预制补丁
   final prePatches = [
@@ -4684,6 +4686,102 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "XOSI", 0x00001000)
     makePlist(patches: patches, replace: true);
   }
 
+  /// SSDT-APIC
+  /// [apicPath] APIC 表路径
+  Future<void> ssdtAPIC({String? apicPath}) async {
+    if (!await ensureDSDT()) return;
+    final (valid, table) = await validateTableSignature(
+      'APIC',
+      tablePath: apicPath,
+    );
+    if (!valid) return;
+
+    Log("正在修补 APIC 表...");
+    int processorIndex = 0;
+    final lines = List<String>.from(table['lines'] ?? []);
+    final int apicLength = lines.length;
+    String ssdt = '';
+
+    for (final tableName in sortedNicely(d.acpiTables.keys.toList())) {
+      final sourceTable = d.acpiTables[tableName]!;
+      final processors = d.getProcessorPaths(table: sourceTable);
+      if (processors.isEmpty) continue;
+
+      for (int index = 0; index < apicLength; index++) {
+        final line = lines[index];
+        final bool isValidProcessorApic =
+            line.contains('Subtable Type :') &&
+            line.contains('[Processor Local APIC]') &&
+            !line.contains('Unknown');
+
+        if (!isValidProcessorApic) {
+          ssdt += '$line\n';
+          continue;
+        }
+
+        final int idLineIndex = index + 2;
+        if (idLineIndex >= apicLength) {
+          ssdt += '$line\n';
+          continue;
+        }
+
+        if (processorIndex >= processors.length) {
+          Log.warning("=> APIC 处理器条目数量超过 $tableName 中的 Processor 数量,已停止修补!");
+          return;
+        }
+
+        final idLine = lines[idLineIndex].trimRight();
+        final String apicProcessorId = idLine.substring(idLine.length - 2);
+        String processorId;
+        try {
+          processorId = sourceTable['lines'][processors[processorIndex][1]]
+              .split(', ')[1]
+              .substring(2);
+        } catch (_) {
+          Log.warning("无法解析 $tableName 中的 Processor ID，终止修补");
+          return;
+        }
+
+        if (processorIndex == 0 && apicProcessorId == processorId) {
+          Log.warning("在 $tableName 中第一个 CPU 已匹配, 无需修补 APIC 表!");
+          return;
+        }
+
+        Log("=> 修正 APIC Processor ID: $apicProcessorId -> $processorId");
+        lines[idLineIndex] =
+            idLine.substring(0, idLine.length - 2) + processorId;
+        processorIndex++;
+        ssdt += '$line\n';
+      }
+    }
+
+    if (ssdt.isEmpty) {
+      Log.warning("=> 未找到 Processor 匹配项! 已终止操作!");
+      return;
+    }
+
+    Log("=> APIC 表修补完成!");
+    const String ssdtName = "SSDT-APIC";
+    Log("正在创建 $ssdtName.dsl...");
+    writeSSDT(ssdtName, ssdt);
+
+    final acpi = {
+      "Comment": "Pathing APIC table - requires original table dropped",
+      "Enabled": true,
+      "Path": "$ssdtName.aml",
+    };
+
+    final drops = [
+      {
+        "Comment": "Drop APIC Table",
+        "Table": table,
+        "Signature": table['signature'] ?? 'APIC',
+      },
+    ];
+
+    makePlist(acpi: acpi, drops: drops);
+  }
+
   /// SSDT-DMAR
   /// [dmarPath] DMAR 表路径
   Future<void> ssdtDMAR({String? dmarPath}) async {
@@ -7428,6 +7526,40 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "SBUSMCHC", 0x00000000)
     }
   }
 
+  void beginPlistBatch() {
+    if (_plistBatchDepth == 0) {
+      _batchedPlists.clear();
+    }
+    _plistBatchDepth++;
+  }
+
+  Future<void> endPlistBatch({bool save = true}) async {
+    if (_plistBatchDepth == 0) return;
+
+    _plistBatchDepth--;
+    if (_plistBatchDepth > 0) return;
+
+    try {
+      if (save) {
+        _saveBatchedPlists();
+      }
+    } finally {
+      _batchedPlists.clear();
+    }
+  }
+
+  void _saveBatchedPlists() {
+    final parser = PlistParser();
+    for (final entry in _batchedPlists.entries) {
+      final plist = entry.value;
+      if (plist.isEmpty) continue;
+
+      final success = parser.savePlist(entry.key, plist);
+      Log(success ? '已成功保存文件到：${entry.key}' : '保存失败：${entry.key}');
+      Log('');
+    }
+  }
+
   void _makeSinglePlist(
     PlistType type, {
     Map<String, dynamic>? acpi,
@@ -7441,19 +7573,32 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "SBUSMCHC", 0x00000000)
       _plistName(type),
     );
     final parser = PlistParser();
-    final result = parser.loadPlist(plistPath);
+    final isBatching = _plistBatchDepth > 0;
+    final usesBatchedPlist =
+        isBatching && _batchedPlists.containsKey(plistPath);
+    final result = usesBatchedPlist
+        ? PlistParseResult(
+            status: PlistParseStatus.success,
+            data: _batchedPlists[plistPath],
+          )
+        : parser.loadPlist(plistPath);
 
     if (result.status == PlistParseStatus.parseError) {
       Log(result.message);
       return;
     }
-    Log(
-      result.status == PlistParseStatus.success
-          ? '读取文件：$plistPath'
-          : '创建文件：$plistPath',
-    );
+    if (!usesBatchedPlist) {
+      Log(
+        result.status == PlistParseStatus.success
+            ? '读取文件：$plistPath'
+            : '创建文件：$plistPath',
+      );
+    }
 
     var plist = result.data ?? {};
+    if (isBatching) {
+      _batchedPlists[plistPath] = plist;
+    }
     if (type == PlistType.openCore) {
       _prepareOpenCore(
         plist,
@@ -7484,7 +7629,7 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "SBUSMCHC", 0x00000000)
       );
     }
 
-    if (plist.isNotEmpty) {
+    if (!isBatching && plist.isNotEmpty) {
       final success = parser.savePlist(plistPath, plist);
       Log(success ? '已成功保存文件到：$plistPath' : '保存失败：$plistPath');
       Log('');

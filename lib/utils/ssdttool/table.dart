@@ -1,5 +1,5 @@
-//  table.dart 
-//  Created by JeoJay127 
+//  table.dart
+//  Created by JeoJay127
 //
 extension MapExtension on Map<String, dynamic> {
   String get name => this['name'] ?? '';
@@ -155,6 +155,16 @@ class ACPITable {
 •	支持的硬件范围： I225 网卡、Aquantia 网卡、部分 WiFi 设备等。
 •	需在固件中 Drop 掉原有 DMAR 表，才能加载修补后的表。
 •	适用 CPU： 任何支持 VT-d 技术的处理器。
+''',
+  };
+
+  static const ssdtAPIC = {
+    'name': 'SSDT-APIC',
+    'remark': '修正APIC表,解决CPU内核panic问题(适用于HEDT服务器平台)',
+    'note': '''
+•	修复或重写 APIC 表中的 Processor ID,确保 macOS 能正确识别 CPU 核心数量和编号,避免内核 panic 或核心识别错误。
+•	需在固件中 Drop 掉原有 APIC 表，才能加载修补后的表。
+•	适用于X58, X79, X99, X299 等 Intel 服务器(HEDT)平台。
 ''',
   };
 

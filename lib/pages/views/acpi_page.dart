@@ -1,5 +1,5 @@
-//  acpi_page.dart 
-//  Created by JeoJay127 
+//  acpi_page.dart
+//  Created by JeoJay127
 //
 import 'package:flutter/material.dart';
 import 'package:rapidssdt/pages/model/patch_state.dart';
@@ -103,6 +103,19 @@ class _AcpiPageState extends State<AcpiPage> {
         ),
       ),
 
+      ACPITable.ssdtAPIC.name: () => buildWithConfig(
+        (data) => TableSelectionWidget(
+          buttonText: '选择APIC',
+          hintText: '请选择需要定制的APIC表',
+          initialPath: data,
+          onChanged: (value) => patchViewModel.updatePatchConfigPath(
+            action,
+            value,
+            onError: (error) => Log.warning(error),
+          ),
+        ),
+      ),
+
       ACPITable.ssdtIMEI.name: () => bindConfig(
         (data, onChanged) => IMEIPatchOptions(onChanged: onChanged),
       ),
@@ -136,7 +149,6 @@ class _AcpiPageState extends State<AcpiPage> {
 
       ACPITable.ssdtGPUSPOOF.name: () =>
           bindConfig((data, onChanged) => GpuSpoof(onChanged: onChanged)),
-          
     };
 
     return widgetBuilders[action]?.call() ?? const SizedBox.shrink();
@@ -496,8 +508,8 @@ class _AcpiPageState extends State<AcpiPage> {
             '合并config',
             style: TextStyle(fontSize: 11, color: Colors.white),
           ),
-          onTap: () =>
-              patchViewModel.mergePlist(onError: (msg) => Log.error(msg)),
+          onTap: () async =>
+              await patchViewModel.mergePlist(onError: (msg) => Log.error(msg)),
         ),
         Flexible(
           child: _buildFilePicker(

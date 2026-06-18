@@ -48,8 +48,12 @@ class _SsdtPlatformState extends State<SsdtPlatformWidget> {
         ? Set.from(ssdtItems)
         : {
             for (final e in ssdtItems)
-              if (e.isBasic) e,
+              if (_isDefaultSelected(e)) e,
           };
+  }
+
+  bool _isDefaultSelected(SsdtItem item) {
+    return item.isBasic || (platformType == '服务器' && item.isRecommend);
   }
 
   // 解析平台 SSDT 状态
@@ -76,7 +80,7 @@ class _SsdtPlatformState extends State<SsdtPlatformWidget> {
   }
 
   // 执行 SSDT 补丁
-  void _runSelectedSsdt({required bool prebuilt}) {
+  Future<void> _runSelectedSsdt({required bool prebuilt}) async {
     if (selectedSsdtNotifier.value.isEmpty) {
       Log('未选择任何 SSDT');
       return;
@@ -93,10 +97,11 @@ class _SsdtPlatformState extends State<SsdtPlatformWidget> {
     Log("");
     String outputFolder =
         "${selectedComboBoxValue.value}-${prebuilt ? '预制SSDT' : '定制SSDT'}";
-    patchViewModel.runPatches(
+    await patchViewModel.runPatches(
       ssdts,
       prebuilt: prebuilt,
       outputFolder: outputFolder,
+      onError: (error) => Log.error(error),
     );
   }
 
@@ -321,7 +326,7 @@ class _SsdtPlatformState extends State<SsdtPlatformWidget> {
               "定制SSDT",
               style: TextStyle(fontSize: 11, color: Colors.white),
             ),
-            onTap: () => _runSelectedSsdt(prebuilt: false),
+            onTap: () async => await _runSelectedSsdt(prebuilt: false),
           ),
           const SizedBox(width: 10),
           InkWellWidget.common(
@@ -329,7 +334,7 @@ class _SsdtPlatformState extends State<SsdtPlatformWidget> {
               "预制SSDT",
               style: TextStyle(fontSize: 11, color: Colors.white),
             ),
-            onTap: () => _runSelectedSsdt(prebuilt: true),
+            onTap: () async => await _runSelectedSsdt(prebuilt: true),
           ),
         ],
       ),

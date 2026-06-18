@@ -1,5 +1,5 @@
-//  ssdt_category.dart 
-//  Created by JeoJay127 
+//  ssdt_category.dart
+//  Created by JeoJay127
 //
 import 'package:rapidssdt/utils/ssdttool/table.dart';
 
@@ -53,6 +53,7 @@ class SsdtCategory {
       'name': '专用补丁',
       'remark': '仅在特定主板或架构需要的补丁',
       'actions': [
+        ACPITable.ssdtAPIC,
         ACPITable.ssdtIMEI,
         ACPITable.ssdtUNC,
         ACPITable.ssdtRTC0RANGE,

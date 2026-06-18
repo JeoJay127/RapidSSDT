@@ -1,7 +1,9 @@
 //  manager.dart
 //  Created by JeoJay127
 //
+import 'dart:async';
 import 'dart:io';
+import 'package:path/path.dart' as path;
 import 'package:rapidssdt/utils/ssdttool/merge.dart';
 import 'package:rapidssdt/utils/ssdttool/ssdt.dart';
 import 'package:rapidssdt/utils/ssdttool/config.dart';
@@ -35,7 +37,10 @@ class PatchContext {
 }
 
 typedef PatchExecutor =
-    void Function({PatchContext context, Map<String, dynamic> action});
+    FutureOr<void> Function({
+      PatchContext? context,
+      Map<String, dynamic>? action,
+    });
 
 class ACPIToolManager {
   final SSDT ssdt;
@@ -56,17 +61,13 @@ class ACPIToolManager {
       final value = entry.value;
 
       if (value['signature'] == tableSignature) {
-        return '${ssdt.config.outputDirectory}/$key';
+        return path.join(ssdt.config.outputDirectory!, key);
       }
     }
     return '';
   }
 
-  late Map<
-    String,
-    void Function({PatchContext context, Map<String, dynamic>? action})
-  >
-  _actionMap;
+  late Map<String, PatchExecutor> _actionMap;
   List<String> get actionKeys => _actionMap.keys.toList();
 
   bool _pb(PatchContext? context) => context?.prebuilt ?? false;
@@ -127,6 +128,10 @@ class ACPIToolManager {
           ({PatchContext? context, Map<String, dynamic>? action}) =>
               ssdt.ssdtPMC(prebuilt: _pb(context)),
 
+      ACPITable.ssdtAPIC.name:
+          ({PatchContext? context, Map<String, dynamic>? action}) =>
+              ssdt.ssdtAPIC(apicPath: context?.data),
+
       ACPITable.ssdtDMAR.name:
           ({PatchContext? context, Map<String, dynamic>? action}) =>
               ssdt.ssdtDMAR(dmarPath: context?.data),
@@ -155,21 +160,29 @@ class ACPIToolManager {
           ({PatchContext? context, Map<String, dynamic>? action}) =>
               ssdt.ssdtPLUG(prebuilt: _pb(context), alderlakeOrLater: true),
 
-      ACPITable.ssdtPCIDISABLE.name:
-          ({PatchContext? context, Map<String, dynamic>? action}) =>
-              ssdt.ssdtPCIDISABLE(
-                pciPath: context?.data?.$1,
-                disableMethod: context?.data?.$2,
-                type: context?.data?.$3,
-              ),
+      ACPITable
+          .ssdtPCIDISABLE
+          .name: ({PatchContext? context, Map<String, dynamic>? action}) {
+        final data = _actionData(context, action);
+        return ssdt.ssdtPCIDISABLE(
+          pciPath:
+              _dataValue(data, 0, 'acpiPath') ?? _dataValue(data, 0, 'pciPath'),
+          disableMethod: _dataValue(data, 1, 'disableMethod'),
+          type: _dataValue(data, 2, 'type'),
+        );
+      },
 
-      ACPITable.ssdtGPUSPOOF.name:
-          ({PatchContext? context, Map<String, dynamic>? action}) =>
-              ssdt.ssdtGPUSPOOF(
-                gpuPath: context?.data?.$1,
-                deviceId: context?.data?.$2,
-                fakeModel: context?.data?.$3,
-              ),
+      ACPITable
+          .ssdtGPUSPOOF
+          .name: ({PatchContext? context, Map<String, dynamic>? action}) {
+        final data = _actionData(context, action);
+        return ssdt.ssdtGPUSPOOF(
+          gpuPath:
+              _dataValue(data, 0, 'acpiPath') ?? _dataValue(data, 0, 'gpuPath'),
+          deviceId: _dataValue(data, 1, 'deviceId'),
+          fakeModel: _dataValue(data, 2, 'fakeModel'),
+        );
+      },
 
       ACPITable.ssdtBridge.name:
           ({PatchContext? context, Map<String, dynamic>? action}) =>
@@ -255,6 +268,27 @@ class ACPIToolManager {
     };
   }
 
+  dynamic _actionData(PatchContext? context, Map<String, dynamic>? action) {
+    final extra = action?['extra'];
+    if (extra is Map || extra is List) return extra;
+    return context?.data;
+  }
+
+  String? _dataValue(dynamic data, int index, String key) {
+    if (data is Map) return data[key]?.toString();
+    if (data is List && index < data.length) return data[index]?.toString();
+    try {
+      return switch (index) {
+        0 => data?.$1?.toString(),
+        1 => data?.$2?.toString(),
+        2 => data?.$3?.toString(),
+        _ => null,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> runPatch(
     Map<String, dynamic> action, {
     PatchContext? context,
@@ -266,9 +300,7 @@ class ACPIToolManager {
       try {
         final ctx = context ?? PatchContext();
         ssdt.outputFolder = outputFolder ?? resultFolder;
-        await Future.sync(() {
-          return executor(context: ctx, action: action);
-        });
+        await executor(context: ctx, action: action);
       } catch (e) {
         onError?.call('执行失败: $action, 错误: $e');
       }
@@ -277,11 +309,26 @@ class ACPIToolManager {
     }
   }
 
+  Future<void> runPatchBatch(
+    Future<void> Function() action, {
+    bool Function()? shouldSave,
+  }) async {
+    ssdt.beginPlistBatch();
+    try {
+      await action();
+      await ssdt.endPlistBatch(save: shouldSave?.call() ?? true);
+    } catch (_) {
+      await ssdt.endPlistBatch(save: false);
+      rethrow;
+    }
+  }
+
   Future<void> runPatches(
     List<Map<String, dynamic>> actions, {
     PatchContext? context,
     String? outputFolder,
     Function(String)? onError,
+    bool copyToResults = true,
   }) async {
     // 清空 outputFolder 目录
     if (outputFolder != null) {
@@ -302,14 +349,27 @@ class ACPIToolManager {
       );
     }
 
-    await _waitForDirectoryStable(
-      "${ssdt.config.outputDirectory!}/$outputFolder",
+    final targetOutputFolder = outputFolder ?? resultFolder;
+    final outputPath = path.join(
+      ssdt.config.outputDirectory!,
+      targetOutputFolder,
     );
+    final resultPath = path.join(ssdt.config.outputDirectory!, resultFolder);
 
-    await ssdt.util.copyDirectory(
-      "${ssdt.config.outputDirectory!}/$outputFolder",
-      "${ssdt.config.outputDirectory!}/$resultFolder",
-    );
+    await _waitForDirectoryStable(outputPath);
+
+    if (copyToResults && outputPath != resultPath) {
+      await ssdt.util.copyDirectory(outputPath, resultPath);
+    }
+  }
+
+  Future<void> copyPatchOutputToResults(String outputFolder) async {
+    final outputPath = path.join(ssdt.config.outputDirectory!, outputFolder);
+    final resultPath = path.join(ssdt.config.outputDirectory!, resultFolder);
+
+    await _waitForDirectoryStable(outputPath);
+    await ssdt.util.clearDirectory(ssdt.config.outputDirectory!, resultFolder);
+    await ssdt.util.copyDirectory(outputPath, resultPath);
   }
 
   Future<void> _waitForDirectoryStable(
@@ -371,16 +431,16 @@ class ACPIToolManager {
       await ssdt.loadTables(dumpPath);
 
   /// ================== 合并 plist 文件 ==================
-  void mergePlist(
+  Future<void> mergePlist(
     String patchedPath,
     String configPath, {
     bool overwrite = true,
-  }) {
+  }) async {
     _merge
       ..patchedPath = patchedPath
       ..configPath = configPath
       ..overwrite = overwrite;
-    _merge.mergePlist();
+    await _merge.mergePlist();
   }
 
   String? getPlistType(String plistPath, {Function(String)? onError}) {

@@ -20,7 +20,7 @@ class PatchViewModel extends ChangeNotifier {
   ValueNotifier<PatchState> get state => _state;
   Map<String, PatchConfig> get patchConfigs => _patchConfigs;
   String get desktopDirectory => _desktopDirectory;
-  
+
   bool _isDumping = false;
   final ACPIToolManager manager;
   // 补丁分类常量
@@ -80,6 +80,7 @@ class PatchViewModel extends ChangeNotifier {
       deleteDsl: newConfig.deleteDsl,
       useLeagcyiAsl: newConfig.useLeagcyiAsl,
       force: newConfig.force,
+      overwriteEFI: newConfig.overwriteEFI,
       acpiMatchMode: newConfig.acpiMatchMode,
       outputDirectory:
           newConfig.outputDirectory ?? manager.acpiConfig.outputDirectory,
@@ -183,6 +184,7 @@ class PatchViewModel extends ChangeNotifier {
   void _initTargetSSDTPath() {
     try {
       const Map<String, String> tableSignatureMap = {
+        'SSDT-APIC': 'APIC',
         'SSDT-DMAR': 'DMAR',
         'SSDT-FACP': 'FACP',
         'Check-AOAC': 'FACP', // 特殊映射
@@ -328,23 +330,40 @@ class PatchViewModel extends ChangeNotifier {
   }
 
   /// 批量执行补丁
-  void runPatches(
+  Future<void> runPatches(
     List<Map<String, dynamic>> actions, {
     bool prebuilt = false,
     String? outputFolder,
     Function(String)? onError,
-  }) {
+  }) async {
     if (actions.isEmpty) {
       onError?.call('补丁列表为空!');
       return;
     }
     final context = _state.value.patchContext.copyWith(prebuilt: prebuilt);
-    manager.runPatches(
-      actions,
-      context: context,
-      outputFolder: outputFolder,
-      onError: onError,
-    );
+    if (prebuilt) {
+      await manager.runPatches(
+        actions,
+        context: context,
+        outputFolder: outputFolder,
+        onError: onError,
+      );
+      return;
+    }
+
+    await manager.runPatchBatch(() async {
+      await manager.runPatches(
+        actions,
+        context: context,
+        outputFolder: outputFolder,
+        onError: onError,
+        copyToResults: false,
+      );
+    });
+
+    if (outputFolder != null) {
+      await manager.copyPatchOutputToResults(outputFolder);
+    }
   }
 
   /// 检查IASL工具有效性
@@ -456,7 +475,7 @@ class PatchViewModel extends ChangeNotifier {
   }
 
   /// 合并plist文件（ACPI配置与config.plist整合）
-  void mergePlist({Function(String)? onError}) {
+  Future<void> mergePlist({Function(String)? onError}) async {
     try {
       final currentState = _state.value;
 
@@ -480,8 +499,8 @@ class PatchViewModel extends ChangeNotifier {
       }
 
       // 执行合并操作
-      manager.mergePlist(
-        currentState.tablePath!,
+      await manager.mergePlist(
+        currentState.outputDir,
         currentState.configPath!,
         overwrite: config.overwriteEFI,
       );

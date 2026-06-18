@@ -1,5 +1,5 @@
-//  log.dart 
-//  Created by JeoJay127 
+//  log.dart
+//  Created by JeoJay127
 //
 import 'dart:async';
 import 'dart:collection';
@@ -52,13 +52,7 @@ class LogConfig {
 
   bool isLevelAllowed(LogLevel level) {
     if (!enableLevelFilter) return true;
-    final p = {
-      LogLevel.debug: 0,
-      LogLevel.info: 1,
-      LogLevel.warning: 2,
-      LogLevel.error: 3,
-    };
-    return p[level]! >= p[minLevel]!;
+    return level.index >= minLevel.index;
   }
 }
 
@@ -68,7 +62,7 @@ typedef LogChannelCreatedCallback = void Function(Log log);
 class Log {
   static final Map<String, Log> _channels = {};
   static const String defaultChannel = 'default';
-  static final separator = Platform.isWindows ? '\\' : '/';
+  static final separator = Platform.pathSeparator;
   final String channel;
   final LogLevel defaultLevel;
   final LogConfig config;
@@ -103,7 +97,7 @@ class Log {
   Log._(this.channel, this.defaultLevel, this.config) {
     _initialized = _initFile();
   }
-  
+
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
@@ -303,19 +297,20 @@ class Log {
       Log.width(channel: channel).add(msg, level: LogLevel.warning);
   static Future<void> error(String msg, {String? channel}) =>
       Log.width(channel: channel).add(msg, level: LogLevel.error);
-  
+
   /// 清除指定日志通道的日志
   static Future<void> clear({String? channel}) async {
     final log = _channels[channel ?? defaultChannel];
     if (log != null) await log._clear();
   }
+
   /// 清除所有日志通道的日志
   static Future<void> clearAll() async {
     for (final log in _channels.values) {
       await log._clear();
     }
   }
-  
+
   /// 关闭所有日志通道
   static Future<void> shutdownAll() async {
     for (final log in _channels.values) {
