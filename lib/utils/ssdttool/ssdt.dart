@@ -4,6 +4,7 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:rapidssdt/extensions/string_extension.dart';
+import 'package:rapidssdt/utils/log/log_config.dart';
 import 'package:rapidssdt/utils/ssdttool/dsdt.dart';
 import 'package:rapidssdt/utils/ssdttool/parser.dart';
 import 'package:rapidssdt/utils/ssdttool/util.dart';
@@ -12,13 +13,15 @@ import 'config.dart';
 import 'prebuilt.dart';
 import 'run.dart';
 import 'package:path/path.dart' as path;
+import 'battery_external_normalizer.dart';
+import 'battery_body_transformer.dart';
+import 'battery_namespace_resolver.dart';
 
 typedef _NativePnlfDevice = ({
   String tableName,
   Map<String, dynamic> table,
   List<dynamic> path,
 });
-typedef _IgpuPathResult = ({String path, bool guessed, bool manual});
 
 class SSDT {
   final Run run = Run();
@@ -44,6 +47,9 @@ class SSDT {
   ACPIMatchMode? _lastACPIMatchMode = ACPIMatchMode.leastStrict;
   int _plistBatchDepth = 0;
   final Map<String, Map<String, dynamic>> _batchedPlists = {};
+  List<BatteryNamespaceObject> _batteryNamespaceObjects = const [];
+  final Set<String> _batteryBodyExternals = {};
+  final Set<String> _batteryRegionWarnings = {};
 
   /// 预制补丁
   final prePatches = [
@@ -389,9 +395,11 @@ class SSDT {
   Future<String?> loadTables(String fileOrFolderPath) async {
     if (!checkIasl() || fileOrFolderPath.isEmpty) return null;
     final stopwatch = Stopwatch()..start();
+    bool delegatedToAcpiDirectory = false;
     try {
       List<String> tables = [];
       List<String> exclude = [];
+      String? externalDsdtPath;
       String? troubleDsdt;
       bool fixed = false;
       String? temp;
@@ -424,6 +432,7 @@ class SSDT {
         if (tables.isEmpty) {
           final acpiDir = Directory(path.join(fileOrFolderPath, "ACPI"));
           if (acpiDir.existsSync()) {
+            delegatedToAcpiDirectory = true;
             return await loadTables(path.join(fileOrFolderPath, "ACPI"));
           }
 
@@ -454,15 +463,99 @@ class SSDT {
         final dsdt = dsdtList.isNotEmpty ? dsdtList.first : null;
         if (dsdt != null && dsdt.isNotEmpty) {
           Log("");
-          Log("即将反编译 $dsdt，以验证是否需要应用预制补丁…");
-          final (result, failed) = await d.loadTable(
-            path.join(fileOrFolderPath, dsdt),
+          Log("正在反编译 DSDT/SSDT，并检查是否需要应用预制补丁…");
+          final mixedTables = tables
+              .where(
+                (table) => const {"DSDT", "SSDT"}.contains(
+                  d.tableSignature(path.join(fileOrFolderPath, table)),
+                ),
+              )
+              .toList();
+          final otherTables = tables
+              .where((table) => !mixedTables.contains(table))
+              .toList();
+
+          if (mixedTables.length == 1) {
+            Log('正在反编译 ${mixedTables.first} 文件...');
+          } else {
+            Log('正在批量反编译 DSDT.aml 和 SSDT.aml 文件...');
+          }
+
+          final dsdtPath = path.join(fileOrFolderPath, dsdt);
+          final (dsdtResult, dsdtFailed) = await d.loadTable(
+            dsdtPath,
+            logProgress: false,
           );
-          if (result.isNotEmpty) {
-            exclude.add(dsdt);
+          if (dsdtResult.isNotEmpty) {
+            externalDsdtPath = dsdtPath;
+            Log('=> $dsdt 反编译成功！');
+
+            final failed = <dynamic>[...dsdtFailed];
+            final retryTables = <String>[];
+            for (final table in mixedTables.where((table) => table != dsdt)) {
+              final tablePath = path.join(fileOrFolderPath, table);
+              final (tableResult, _) = await d.loadTable(
+                tablePath,
+                externalTables: [dsdtPath],
+                logProgress: false,
+              );
+              if (tableResult.isNotEmpty) {
+                Log('=> $table 反编译成功！');
+              } else {
+                Log.warning('=> $table 反编译失败！');
+                retryTables.add(table);
+              }
+              await Log.yieldToUi();
+            }
+
+            if (retryTables.isNotEmpty) {
+              Log('');
+              Log('正在单独反编译失败的.aml 文件...');
+              for (final table in retryTables) {
+                final tablePath = path.join(fileOrFolderPath, table);
+                final (tableResult, tableFailed) = await d.loadTable(
+                  tablePath,
+                  logProgress: false,
+                );
+                if (tableResult.isNotEmpty) {
+                  Log('=> $table 反编译成功！');
+                } else {
+                  Log.error('=> $table 反编译失败！');
+                  failed.addAll(
+                    tableFailed.isEmpty ? [tablePath] : tableFailed,
+                  );
+                }
+                await Log.yieldToUi();
+              }
+              Log('');
+            }
+
+            if (otherTables.isNotEmpty) {
+              Log('正在反编译其他.aml文件...');
+              for (final table in otherTables) {
+                final (tableResult, tableFailed) = await d.loadTable(
+                  path.join(fileOrFolderPath, table),
+                  logProgress: false,
+                );
+                failed.addAll(tableFailed);
+                if (tableResult.isNotEmpty) {
+                  Log('=>  $table 反编译成功！');
+                }
+                await Log.yieldToUi();
+              }
+            }
+
             Log('=> 无需应用预制补丁!\n');
+            if (failed.isNotEmpty) {
+              Log.warning(
+                '=> ${failed.length} 个非 DSDT 表反编译失败并已跳过: ${failed.map((item) => path.basename(item.toString())).join(', ')}',
+              );
+            }
+            Log("所有有效ACPI表反编译完成!");
+            return fileOrFolderPath;
           } else {
             troubleDsdt = dsdt;
+            d.acpiTables.clear();
           }
         }
       } else if (File(fileOrFolderPath).existsSync()) {
@@ -536,6 +629,7 @@ class SSDT {
             final (result, failed) = await d.loadTable(troublePath);
             if (result.isNotEmpty) {
               fixed = true;
+              externalDsdtPath = troublePath;
               Log("=> 先前问题DSDT文件反编译成功!");
               exclude.remove(troublePath);
               makePlist(acpi: null, patches: patches);
@@ -557,10 +651,22 @@ class SSDT {
       if (tables.length > 1) {
         Log("正在加载 $fileOrFolderPath 中的有效ACPI表…");
       }
-      final (result, failed) = await d.loadTable(
-        fileOrFolderPath,
-        exclude: exclude,
-      );
+      final result = <String, dynamic>{};
+      final failed = <dynamic>[];
+      for (final table in tables) {
+        if (exclude.contains(table)) continue;
+        final tablePath = path.join(fileOrFolderPath, table);
+        final isSsdt = d.tableSignature(tablePath) == "SSDT";
+        final (tableResult, tableFailed) = await d.loadTable(
+          tablePath,
+          externalTables: isSsdt && externalDsdtPath != null
+              ? [externalDsdtPath]
+              : const [],
+        );
+        result.addAll(Map<String, dynamic>.from(tableResult));
+        failed.addAll(tableFailed);
+        await Log.yieldToUi();
+      }
 
       if (result.isEmpty && failed.isNotEmpty) {
         d.acpiTables = priorTables;
@@ -572,9 +678,11 @@ class SSDT {
       return fileOrFolderPath;
     } finally {
       stopwatch.stop();
-      final totalTimeMs = stopwatch.elapsedMilliseconds;
-      final totalSeconds = (totalTimeMs / 1000).toStringAsFixed(2);
-      Log('总耗时：$totalSeconds 秒\n');
+      if (!delegatedToAcpiDirectory) {
+        final totalTimeMs = stopwatch.elapsedMilliseconds;
+        final totalSeconds = (totalTimeMs / 1000).toStringAsFixed(2);
+        Log('总耗时：$totalSeconds 秒\n');
+      }
     }
   }
 
@@ -609,7 +717,7 @@ class SSDT {
 
     Log(
       '正在${config.useLeagcyiAsl ? '使用【iasl-legacy旧版编译器】' : ''}编译 $ssdtName.aml...',
-      level: config.useLeagcyiAsl ? LogLevel.warning : LogLevel.info,
+      level: config.useLeagcyiAsl ? LogLevel.warning : LogLevel.debug,
     );
 
     final List<String> iaslArgs = config.force
@@ -2302,149 +2410,285 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "HPET", 0x00000000)
     return matches;
   }
 
-  String _externalAcpiPath(String acpiPath) {
-    final cleanPath = acpiPath.replaceFirst("\\", "");
-    return cleanPath
-        .split(".")
-        .map((part) => part == "_SB" ? "_SB_" : part)
-        .join(".");
+  String _normalizePnlfPath(String value) {
+    final parts = value
+        .replaceAll('\\', '')
+        .split('.')
+        .where((part) => part.isNotEmpty)
+        .map((part) => part.replaceAll(RegExp(r'_+$'), ''))
+        .toList();
+    if (parts.isEmpty) return '';
+    return '\\${parts.join('.')}';
   }
 
-  String _normalizeManualIgpuPath(String manualIGPUPath) {
-    List<String> parts = manualIGPUPath
-        .replaceFirst("\\", "")
-        .toUpperCase()
-        .split(".");
-    String valid = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-    String noStart = "0123456789";
+  String _normalizeManualPnlfPath(String value) {
+    final parts = value
+        .replaceAll('\\', '')
+        .split('.')
+        .where((part) => part.isNotEmpty)
+        .toList();
+    final segment = RegExp(r'^[A-Za-z_][A-Za-z0-9_]{0,3}$');
+    if (parts.isEmpty || parts.any((part) => !segment.hasMatch(part))) {
+      return '';
+    }
+    return _normalizePnlfPath(
+      parts.map((part) => part.toUpperCase()).join('.'),
+    );
+  }
 
-    if (parts.any(
-      (p) =>
-          p.isEmpty ||
-          p.length > 4 ||
-          noStart.contains(p[0]) ||
-          p.split("").any((x) => !valid.contains(x)),
+  String _pnlfLookupPath(String value) => value
+      .replaceAll('\\', '')
+      .split('.')
+      .where((part) => part.isNotEmpty)
+      .map((part) => part.replaceAll(RegExp(r'_+$'), '').toUpperCase())
+      .join('.');
+
+  List<String> _pnlfPciRootPaths() {
+    final roots = <String>[];
+    final seen = <String>{};
+    for (final tableName in sortedNicely(
+      d.acpiTables.keys.toList(),
+      first: 'DSDT.aml',
     )) {
-      Log("无效的 iGPU 路径：$manualIGPUPath");
+      final table = d.acpiTables[tableName] as Map<String, dynamic>?;
+      if (table == null) continue;
+      for (final hid in const ['PNP0A08', 'PNP0A03']) {
+        for (final entry in d.getDevicePathsWithHid(hid: hid, table: table)) {
+          final root = _normalizePnlfPath(entry[0].toString());
+          if (root.isNotEmpty && seen.add(_pnlfLookupPath(root))) {
+            roots.add(root);
+          }
+        }
+      }
     }
-
-    parts = parts.map((p) => p.replaceAll(RegExp(r"_+$"), "")).toList();
-    return "\\${parts.join(".")}";
+    return roots;
   }
 
-  _IgpuPathResult _findIgpuPath({
-    String? manualIGPUPath,
-    bool allowManual = false,
-  }) {
-    String igpu = "";
-    bool guessed = false;
-
-    Log("正在寻找位于 0x00020000 的 iGPU 设备…");
-    final tableNameList = d.acpiTables.keys.toList();
-    final sortedTableNames = sortedNicely(tableNameList, first: "DSDT");
-
-    for (final tableName in sortedTableNames) {
-      final table = d.acpiTables[tableName];
-      Log("正在检查 $tableName…");
-      final paths = d.getPathOfType(objType: "Name", obj: "_ADR", table: table);
-
-      for (final path in paths) {
-        final adr = getAddressFromLine(path[1], table: table);
-        if (adr == 0x00020000) {
-          igpu = path[0].substring(0, path[0].length - 5);
-          Log("=> 在 $igpu 处找到 iGPU 设备!");
-          return (path: igpu, guessed: false, manual: false);
-        }
-      }
-    }
-
-    Log("未通过地址找到 iGPU 设备!");
-    Log("正在搜索常见的 iGPU 名称…");
-
-    for (final tableName in sortedTableNames) {
-      final rawTable = d.acpiTables[tableName];
+  bool _pnlfDevicePathExists(String value) {
+    final expected = _pnlfLookupPath(value);
+    for (final rawTable in d.acpiTables.values) {
       if (rawTable is! Map<String, dynamic>) continue;
-      Log("正在检查 $tableName…");
+      for (final entry in d.getDevicePaths(obj: value, table: rawTable)) {
+        if (_pnlfLookupPath(entry[0].toString()) == expected) return true;
+      }
+    }
+    return false;
+  }
 
-      final pciRoots = [
-        d.getDevicePathsWithHid(hid: "PNP0A08", table: rawTable),
-        d.getDevicePathsWithHid(hid: "PNP0A03", table: rawTable),
-        d.getDevicePathsWithHid(hid: "ACPI0016", table: rawTable),
-      ];
-
-      final external = <String>[];
-      rawTable["lines"]?.forEach((line) {
-        final trimmedLine = line.toString().trim();
-        if (!trimmedLine.startsWith("External (")) return;
-        try {
-          final pathPart = trimmedLine.split('(')[1].split(', ')[0];
-          final processedPath = pathPart
-              .split('.')
-              .map(
-                (segment) =>
-                    segment.replaceAll('\\', '').replaceAll(RegExp(r'_+$'), ''),
-              )
-              .join('.');
-          external.add('\\$processedPath');
-        } catch (_) {
-          debugPrint("Error processing line: $trimmedLine");
-        }
-      });
-
-      for (final rootList in pciRoots) {
-        if (rootList.isEmpty) continue;
-        final rootPath = rootList[0][0].toString();
-        for (final name in [
-          "IGPU",
-          "_VID",
-          "VID0",
-          "VID1",
-          "GFX0",
-          "VGA",
-          "_VGA",
-        ]) {
-          final testPath = "$rootPath.$name";
-          final devicePaths = d.getDevicePaths(obj: testPath, table: rawTable);
-          String? device;
-          if (devicePaths.isNotEmpty) {
-            device = devicePaths[0][0];
-          } else {
-            device = external.firstWhere(
-              (x) => testPath == x,
-              orElse: () => "",
-            );
-            if (device.isEmpty) device = null;
-          }
-
-          if (device == null) continue;
-          if (d
-              .getPathOfType(
-                objType: "Name",
-                obj: "$device._ADR",
-                table: rawTable,
-              )
-              .isNotEmpty) {
-            continue;
-          }
-
-          igpu = device;
-          guessed = true;
-          Log("=> 在 $igpu 处发现了可能的 iGPU 设备");
-          return (path: igpu, guessed: guessed, manual: false);
+  bool _pnlfExternalDevicePathExists(String value) {
+    final expected = _pnlfLookupPath(value);
+    final external = RegExp(
+      r'^\s*External\s*\(\s*([^,]+)\s*,\s*DeviceObj\s*\)',
+      caseSensitive: false,
+    );
+    for (final rawTable in d.acpiTables.values) {
+      if (rawTable is! Map<String, dynamic>) continue;
+      for (final line in List<String>.from(rawTable['lines'] ?? const [])) {
+        final match = external.firstMatch(line);
+        if (match != null &&
+            _pnlfLookupPath(match.group(1) ?? '') == expected) {
+          return true;
         }
       }
     }
+    return false;
+  }
 
-    if (allowManual && manualIGPUPath != null && manualIGPUPath.isNotEmpty) {
-      Log("已按照给定iGPU路径,手动设置为 $manualIGPUPath \n");
-      return (
-        path: _normalizeManualIgpuPath(manualIGPUPath),
-        guessed: false,
-        manual: true,
-      );
+  int? _pnlfAddressValue(List<dynamic> entry, Map<String, dynamic> table) {
+    final parsed = getAddressFromLine(entry[1] as int, table: table);
+    if (parsed != null) return parsed;
+    final lines = List<String>.from(table['lines'] ?? const []);
+    final index = entry[1] as int;
+    if (index < 0 || index >= lines.length) return null;
+    final match = RegExp(
+      r'\b_ADR\s*,\s*(Zero|One|0[xX][0-9A-Fa-f]+|[0-9]+)',
+      caseSensitive: false,
+    ).firstMatch(lines[index]);
+    final literal = match?.group(1);
+    if (literal == null) return null;
+    if (literal.toLowerCase() == 'zero') return 0;
+    if (literal.toLowerCase() == 'one') return 1;
+    return literal.toLowerCase().startsWith('0x')
+        ? int.tryParse(literal.substring(2), radix: 16)
+        : int.tryParse(literal);
+  }
+
+  String _findPnlfIgpuByAddress() {
+    final roots = _pnlfPciRootPaths();
+    if (roots.isEmpty) return '';
+    final rootLookups = roots.map(_pnlfLookupPath).toSet();
+    for (final tableName in sortedNicely(
+      d.acpiTables.keys.toList(),
+      first: 'DSDT.aml',
+    )) {
+      final table = d.acpiTables[tableName] as Map<String, dynamic>?;
+      if (table == null) continue;
+      for (final entry in d.getPathOfType(
+        objType: 'Name',
+        obj: '_ADR',
+        table: table,
+      )) {
+        if (_pnlfAddressValue(entry, table) != 0x00020000) continue;
+        var devicePath = entry[0].toString();
+        if (devicePath.toUpperCase().endsWith('._ADR')) {
+          devicePath = devicePath.substring(0, devicePath.length - 5);
+        }
+        devicePath = _normalizePnlfPath(devicePath);
+        final lookup = _pnlfLookupPath(devicePath);
+        final dot = lookup.lastIndexOf('.');
+        final parent = dot < 0 ? '' : lookup.substring(0, dot);
+        if (rootLookups.contains(parent) && _pnlfDevicePathExists(devicePath)) {
+          return devicePath;
+        }
+      }
     }
+    return '';
+  }
 
-    return (path: "", guessed: false, manual: false);
+  String _findPnlfIgpuByCommonName() {
+    final roots = _pnlfPciRootPaths();
+    for (final name in const [
+      'IGPU',
+      'GFX0',
+      '_VID',
+      'VID0',
+      'VID1',
+      'VGA',
+      '_VGA',
+    ]) {
+      for (final root in roots) {
+        final candidate = _normalizePnlfPath('$root.$name');
+        if (_pnlfDevicePathExists(candidate) ||
+            _pnlfExternalDevicePathExists(candidate)) {
+          return candidate;
+        }
+      }
+    }
+    return '';
+  }
+
+  String _indentAslBlock(String source, int spaces) {
+    final lines = source.split('\n').toList();
+    while (lines.isNotEmpty && lines.first.trim().isEmpty) {
+      lines.removeAt(0);
+    }
+    while (lines.isNotEmpty && lines.last.trim().isEmpty) {
+      lines.removeLast();
+    }
+    var commonIndent = 1 << 30;
+    for (final line in lines.where((line) => line.trim().isNotEmpty)) {
+      final leading = line.length - line.trimLeft().length;
+      if (leading < commonIndent) commonIndent = leading;
+    }
+    if (commonIndent == 1 << 30) commonIndent = 0;
+    final prefix = ' ' * spaces;
+    return lines
+        .map(
+          (line) => line.trim().isEmpty
+              ? ''
+              : '$prefix${line.substring(commonIndent.clamp(0, line.length))}',
+        )
+        .join('\n');
+  }
+
+  String _buildPnlfRegisterBlock() => r'''
+        Field (^RMP3, AnyAcc, NoLock, Preserve)
+        {
+            Offset (0x02), GDID, 16,
+            Offset (0x10), BAR1, 32,
+        }
+
+        OperationRegion (RMB1, SystemMemory, BAR1 & ~0x0F, 0x0E1184)
+        Field (RMB1, AnyAcc, Lock, Preserve)
+        {
+            Offset (0x48250),
+            LEV2, 32,
+            LEVL, 32,
+            Offset (0x70040),
+            P0BL, 32,
+            Offset (0x0C2000),
+            GRAN, 32,
+            Offset (0x0C8250),
+            LEVW, 32,
+            LEVX, 32,
+            LEVD, 32,
+            Offset (0x0E1180),
+            PCHL, 32,
+        }
+
+        Method (_INI, 0, Serialized)
+        {
+            If (_OSI ("Darwin"))
+            {
+                Local0 = GDID
+                Local2 = Ones
+                Local3 = 0
+
+                If (LOr (LEqual (1, Local3), LNotEqual (Match (Package()
+                {
+                    0x010b, 0x0102,
+                    0x0106, 0x1106, 0x1601, 0x0116, 0x0126,
+                    0x0112, 0x0122,
+                    0x0152, 0x0156, 0x0162, 0x0166,
+                    0x016a,
+                    0x0046, 0x0042,
+                }, MEQ, Local0, MTR, 0, 0), Ones)))
+                {
+                    If (LEqual (Local2, Ones))
+                    {
+                        Store (0x710, Local2)
+                    }
+                    Store (LEVX >> 16, Local1)
+                    If (LNot (Local1))
+                    {
+                        Store (Local2, Local1)
+                    }
+                    If (LNotEqual (Local2, Local1))
+                    {
+                        Store ((LEVL * Local2) / Local1, Local0)
+                        Store (Local2 << 16, Local3)
+                        If (LGreater (Local2, Local1))
+                        {
+                            Store (Local3, LEVX)
+                            Store (Local0, LEVL)
+                        }
+                        Else
+                        {
+                            Store (Local0, LEVL)
+                            Store (Local3, LEVX)
+                        }
+                    }
+                }
+            }
+        }''';
+
+  String _buildCustomPnlfDevice(
+    int uid, {
+    required bool includeRegisters,
+    required bool hasIgpuPath,
+  }) {
+    var device =
+        '''Device (PNLF)
+{
+    Name (_HID, EisaId ("APP0002"))
+    Name (_CID, "backlight")
+    Name (_UID, ${util.hexy(uid)})
+
+    Method (_STA, 0, NotSerialized)
+    {
+        If (_OSI ("Darwin"))
+        {
+            Return (0x0B)
+        }
+        Else
+        {
+            Return (Zero)
+        }
+    }''';
+    if (includeRegisters && hasIgpuPath) {
+      device += '\n\n${_indentAslBlock(_buildPnlfRegisterBlock(), 4)}';
+    }
+    return '$device\n}';
   }
 
   /// 背光修复
@@ -2457,7 +2701,6 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "HPET", 0x00000000)
     String? manualIGPUPath,
   }) async {
     if (!await ensureDSDT()) return;
-    // 检查是否提供了有效的 uid
     if (uid == null) {
       Log.warning("未提供有效的 UID，终止操作！");
       return;
@@ -2468,18 +2711,8 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "HPET", 0x00000000)
       Log.warning("$uid 是一个自定义的 UID，可能需要手动定制设置，或者可能根本不受支持!");
     }
 
-    bool getIGpuInfo = false;
-    if (uid == 14) {
-      Log("");
-      Log.warning(
-        "注意:英特尔第1代Arrandale,第2代Sandy Bridge,第3代Ivy Bridge 默认使用 UID:14,但是有些机器使用UID: 14 会遇到最大亮度受限或其他问题.为了解决这些问题,必须设置正确的 iGPU（集成显卡）的设备路径，并且可能需要补充IGPU寄存器信息",
-      );
-      Log("");
-      getIGpuInfo = getIgpu ?? false;
-    }
     final String ssdtName = "SSDT-PNLF";
     Log("正在创建预编译 $ssdtName.dsl...");
-    // 打印所用的UID，使用的平台和对应的PWMMax
     for (var item in PNLFUIDs) {
       if (item['UID'] == uid) {
         Log("=> 使用的UID: ${item['UID']}");
@@ -2488,32 +2721,42 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "HPET", 0x00000000)
       }
     }
 
-    final autoIgpu = _findIgpuPath();
-    final pnlfParentPath = autoIgpu.path;
-    String igpu = autoIgpu.path;
-    bool guessed = autoIgpu.guessed;
-    bool manual = false;
-
-    if (pnlfParentPath.isNotEmpty) {
-      Log("=> 已找到核显 ACPI 路径: $pnlfParentPath");
-      Log("=> 将在 $pnlfParentPath 下挂载 Device (PNLF)");
-    } else {
-      Log("=> 未找到合法核显 ACPI 路径");
-      Log("=> 将退回至根级注入 Device (PNLF)");
+    var igpu = _findPnlfIgpuByAddress();
+    var guessed = false;
+    var manual = false;
+    var detectionLevel = igpu.isEmpty ? 3 : 1;
+    if (uid == 14) {
+      Log.warning("UID 14 平台建议提供正确的 iGPU 路径，并在需要时补充 iGPU 寄存器信息。");
     }
-
-    if (getIGpuInfo && igpu.isEmpty) {
-      if (manualIGPUPath == null || manualIGPUPath.isEmpty) {
-        Log.warning("在传递的 ACPI 表中未找到有效的 iGPU 路径!\n");
-        Log.warning(
-          "请输入要使用的 iGPU ACPI 路径。每个路径元素的字符限制为 4 个字母数字字符（以字母或下划线开头），并用空格分隔。例如: SB.PCI0.GFX0\n",
-        );
+    if (igpu.isEmpty) {
+      igpu = _findPnlfIgpuByCommonName();
+      guessed = igpu.isNotEmpty;
+      detectionLevel = guessed ? 2 : 3;
+    }
+    final providedPath = manualIGPUPath?.trim() ?? '';
+    if (providedPath.isNotEmpty) {
+      final normalized = _normalizeManualPnlfPath(providedPath);
+      if (normalized.isEmpty) {
+        Log.warning("无效的 iGPU 路径：$providedPath");
       } else {
-        Log("已按照给定iGPU路径,手动设置为 $manualIGPUPath \n");
-        igpu = _normalizeManualIgpuPath(manualIGPUPath);
-        guessed = false;
+        igpu = normalized;
         manual = true;
+        guessed = false;
+        detectionLevel = 0;
       }
+    }
+    if (manual) {
+      Log("=> 使用手动指定的 iGPU 路径: $igpu");
+    } else if (detectionLevel == 1) {
+      Log("=> Level 1: 在 PCI Root 直属子设备中通过 _ADR = 0x00020000 定位 iGPU: $igpu");
+    } else if (detectionLevel == 2) {
+      Log("=> Level 2: 在 PCI 命名空间中通过设备名称推断 iGPU: $igpu");
+    } else {
+      Log.warning("=> Level 3: 无法可靠定位 iGPU，将生成根级 PNLF 设备。");
+    }
+    final includeRegisters = getIgpu ?? false;
+    if (includeRegisters && igpu.isEmpty) {
+      Log.warning("未定位到 iGPU，无法补充 PCI 配置及背光寄存器信息。");
     }
 
     List<Map<String, dynamic>> patches = [];
@@ -2559,8 +2802,6 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "HPET", 0x00000000)
           "Comment": "NBCF 0x00 to 0x01 for BrightnessKeys.kext",
           "Find": "084E4243460A00",
           "Replace": "084E4243460A01",
-          "Enabled": true,
-          "Disabled": false,
         });
       }
 
@@ -2575,8 +2816,6 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "HPET", 0x00000000)
           "Comment": "NBCF Zero to One for BrightnessKeys.kext",
           "Find": "084E42434600",
           "Replace": "084E42434601",
-          "Enabled": true,
-          "Disabled": false,
         });
       }
 
@@ -2587,166 +2826,31 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "HPET", 0x00000000)
     }
 
     String ssdt = """//
-// Much of the info pulled from: https://github.com/acidanthera/OpenCorePkg/blob/master/Docs/AcpiSamples/Source/SSDT-PNLF.dsl
+// Much of the info pulled from OpenCorePkg SSDT-PNLF samples.
 //
 DefinitionBlock ("", "SSDT", 2, "RAPID", "PNLF", 0x00000000)
-{""";
-    final externalPaths = <String>{};
-    if (pnlfParentPath.isNotEmpty) externalPaths.add(pnlfParentPath);
-    if (getIGpuInfo && igpu.isNotEmpty) externalPaths.add(igpu);
-
-    for (final externalPath in externalPaths) {
-      ssdt +=
-          """
-    External (${_externalAcpiPath(externalPath)}, DeviceObj)
+{
 """;
+    if (igpu.isNotEmpty) {
+      ssdt += "    External ($igpu, DeviceObj)\n";
     }
-    String pnlfDevice = """
-    Device (PNLF)
-    {
-        Name (_HID, EisaId ("APP0002"))  // _HID: Hardware ID
-        Name (_CID, "backlight")  // _CID: Compatible ID
-        Name (_UID, [[uid_value]])  // _UID: Unique ID: [[uid_dec]]
-        
-        Method (_STA, 0, NotSerialized)  // _STA: Status
-        {
-            If (_OSI ("Darwin"))
-            {
-                Return (0x0B)
-            }
-            Else
-            {
-                Return (Zero)
-            }
-        }""";
-    if (getIGpuInfo && igpu.isNotEmpty) {
-      pnlfDevice += """
-        Method (_INI, 0, Serialized)
-        {
-            If (LAnd (_OSI ("Darwin"), CondRefOf ([[igpu_path]])))
-            {
-                OperationRegion ([[igpu_path]].RMP3, PCI_Config, Zero, 0x14)
-                Field ([[igpu_path]].RMP3, AnyAcc, NoLock, Preserve)
-                {
-                    Offset (0x02), GDID,16,
-                    Offset (0x10), BAR1,32,
-                }
-                // IGPU PWM backlight register descriptions:
-                //   LEV2 not currently used
-                //   LEVL level of backlight in Sandy/Ivy
-                //   P0BL counter, when zero is vertical blank
-                //   GRAN see description below in INI1 method
-                //   LEVW should be initialized to 0xC0000000
-                //   LEVX PWMMax except FBTYPE_HSWPLUS combo of max/level (Sandy/Ivy stored in MSW)
-                //   LEVD level of backlight for Coffeelake
-                //   PCHL not currently used
-                OperationRegion (RMB1, SystemMemory, BAR1 & ~0xF, 0xe1184)
-                Field(RMB1, AnyAcc, Lock, Preserve)
-                {
-                    Offset (0x48250),
-                    LEV2, 32,
-                    LEVL, 32,
-                    Offset (0x70040),
-                    P0BL, 32,
-                    Offset (0xc2000),
-                    GRAN, 32,
-                    Offset (0xc8250),
-                    LEVW, 32,
-                    LEVX, 32,
-                    LEVD, 32,
-                    Offset (0xe1180),
-                    PCHL, 32,
-                }
-                // Now fixup the backlight PWM depending on the framebuffer type
-                // At this point:
-                //   Local4 is RMCF.BLKT value (unused here), if specified (default is 1)
-                //   Local0 is device-id for IGPU
-                //   Local2 is LMAX, if specified (Ones means based on device-id)
-                //   Local3 is framebuffer type
-
-                // Adjustment required when using WhateverGreen.kext
-                Local0 = GDID
-                Local2 = Ones
-                Local3 = 0
-
-                // check Sandy/Ivy
-                // #define FBTYPE_SANDYIVY 1
-                If (LOr (LEqual (1, Local3), LNotEqual (Match (Package()
-                {
-                    // Sandy HD3000
-                    0x010b, 0x0102,
-                    0x0106, 0x1106, 0x1601, 0x0116, 0x0126,
-                    0x0112, 0x0122,
-                    // Ivy
-                    0x0152, 0x0156, 0x0162, 0x0166,
-                    0x016a,
-                    // Arrandale
-                    0x0046, 0x0042,
-                }, MEQ, Local0, MTR, 0, 0), Ones)))
-                {
-                    if (LEqual (Local2, Ones))
-                    {
-                        // #define SANDYIVY_PWMMAX 0x710
-                        Store (0x710, Local2)
-                    }
-                    // change/scale only if different than current...
-                    Store (LEVX >> 16, Local1)
-                    If (LNot (Local1))
-                    {
-                        Store (Local2, Local1)
-                    }
-                    If (LNotEqual (Local2, Local1))
-                    {
-                        // set new backlight PWMMax but retain current backlight level by scaling
-                        Store ((LEVL * Local2) / Local1, Local0)
-                        Store (Local2 << 16, Local3)
-                        If (LGreater (Local2, Local1))
-                        {
-                            // PWMMax is getting larger... store new PWMMax first
-                            Store (Local3, LEVX)
-                            Store (Local0, LEVL)
-                        }
-                        Else
-                        {
-                            // otherwise, store new brightness level, followed by new PWMMax
-                            Store (Local0, LEVL)
-                            Store (Local3, LEVX)
-                        }
-                    }
-                }
-            }
-        }""";
-    }
-    pnlfDevice += """
-    }""";
-
-    if (pnlfParentPath.isNotEmpty) {
-      final scopedPnlfDevice = pnlfDevice
-          .split("\n")
-          .map((line) => line.isEmpty ? line : "    $line")
-          .join("\n");
-      ssdt +=
-          """
-    Scope ([[pnlf_parent_path]])
-    {
-$scopedPnlfDevice
-    }
-}""";
+    final device = _buildCustomPnlfDevice(
+      uid,
+      includeRegisters: includeRegisters,
+      hasIgpuPath: igpu.isNotEmpty,
+    );
+    if (igpu.isNotEmpty) {
+      ssdt += "\n    Scope ($igpu)\n    {\n";
+      if (includeRegisters) {
+        ssdt += "        OperationRegion (RMP3, PCI_Config, Zero, 0x14)\n\n";
+      }
+      ssdt += '${_indentAslBlock(device, 8)}\n    }\n';
     } else {
-      ssdt +=
-          """
-$pnlfDevice
-}""";
+      ssdt += '\n${_indentAslBlock(device, 4)}\n';
     }
+    ssdt += '}\n';
 
-    // 替换占位符
-    ssdt = ssdt
-        .replaceAll(r"[[uid_value]]", util.hexy(uid))
-        .replaceAll(r"[[uid_dec]]", uid.toString())
-        .replaceAll(r"[[igpu_path]]", igpu)
-        .replaceAll(r"[[pnlf_parent_path]]", pnlfParentPath);
-    // 写入 SSDT 文件
-    writeSSDT(ssdtName, ssdt);
+    await writeSSDT(ssdtName, ssdt);
     Map<String, dynamic> acpi = {
       "Comment":
           "Defines PNLF device with a _UID of $uid for backlight control${patches.any((p) => p["Comment"].contains("XNLF")) ? " - requires PNLF to XNLF rename" : ""}",
@@ -2765,8 +2869,6 @@ $pnlfDevice
       }
     }
 
-    hasNbcfOld = patches.any((p) => p["Comment"].contains("NBCF 0x00"));
-    hasNbcfNew = patches.any((p) => p["Comment"].contains("NBCF Zero"));
     if (hasNbcfOld || hasNbcfNew) {
       Log.warning(
         "注意：已生成 NBCF 补丁(依赖BrightnessKeys.kext驱动),默认启用！如果在使用过程中遇到问题,请禁用该补丁!",
@@ -6956,7 +7058,7 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "CPUR", 0x00003000)
         }
       } else if (disableMethod == 'PS3') {
         Log('正在检查设备 $pciPath 是否存在 _PS3 或 _DSM 方法...');
-        foundMethod = _hasMethodInTables(pciPath, ['_PS3,_DSM']);
+        foundMethod = _hasMethodInTables(pciPath, ['_PS3', '_DSM']);
         if (!foundMethod) {
           Log.warning('在 DSDT 或 SSDT 中未找到 $pciPath 对应的 _PS3 或 _DSM 方法! 已终止操作!');
           return;
@@ -7216,6 +7318,3957 @@ DefinitionBlock("", "SSDT", 2, "RAPID", "PS3", 0)
   }
 
   /// SMBUS
+  Future<void> ssdtBAT() async {
+    try {
+      await _ssdtBAT();
+    } on StateError catch (error) {
+      Log.error("SSDT-BAT 生成失败：${error.message}");
+    }
+  }
+
+  Future<void> _ssdtBAT() async {
+    if (!await ensureDSDT()) return;
+
+    _batteryBodyExternals.clear();
+    _batteryRegionWarnings.clear();
+    _batteryNamespaceObjects = BatteryNamespaceResolver.collectObjects(
+      d.acpiTables.values,
+      detectNameType: d.detectNameType,
+    );
+
+    // 根据是否存在B1B2电池方法，简单判断是否已经补丁
+    final batteryMethodB1B2 = d.getMethodPaths(obj: "B1B2");
+    if (batteryMethodB1B2.isNotEmpty) {
+      Log.warning("检测到 B1B2 电池宽字节(超过8字节)读取方法,当前DSDT可能已经打过补丁,请提取原始ACPI表再尝试!");
+      return;
+    }
+    // 根据是否存在B1B4电池方法，简单判断是否已经补丁
+    final batteryMethodB1B4 = d.getMethodPaths(obj: "B1B4");
+    if (batteryMethodB1B4.isNotEmpty) {
+      Log.warning("检测到 B1B4 电池宽字节(超过8字节)读取方法,当前DSDT可能已经打过补丁,请提取原始ACPI表再尝试!");
+      return;
+    }
+
+    Log("正在分析电池设备（PNP0C0A）…");
+    await Log.yieldToUi();
+    // 1. 查找所有符合条件的电池设备
+    final batteryDevices = _findBatteryDevices();
+    if (batteryDevices.isEmpty) {
+      Log.warning("=> 未找到可用于热补丁的电池设备（需包含 _STA/_BST/_BIX 或 _BIF）");
+      return;
+    }
+
+    // 2.查找所有EC设备
+    Log("正在分析EC设备（PNP0C09）…");
+    await Log.yieldToUi();
+    final ecDevices = _findECDevices();
+    if (ecDevices.isEmpty) {
+      Log.warning("=> 未找到EC设备,已终止操作！");
+      return;
+    }
+    _batteryNamespaceObjects = BatteryNamespaceResolver.mergeDeviceObjects(
+      existing: _batteryNamespaceObjects,
+      devices: [...batteryDevices, ...ecDevices],
+    );
+
+    // 3.判断单电池/多电池，并构建依赖表T
+    final batteryMethods = <String>{"_STA", "_BST", "_BIF", "_BIX", "_BTP"};
+    final isMultiBattery = batteryDevices.length > 1;
+    if (!isMultiBattery && batteryDevices.first["usesSystemMemory"] == true) {
+      Log(
+        "=> ${batteryDevices.first['path']} 使用 SystemMemory OperationRegion，将按动态/静态基址生成内存访问辅助方法。",
+      );
+    }
+    if (isMultiBattery) {
+      final parentScopes = batteryDevices
+          .map((battery) => (battery['scope'] ?? '').toString().toUpperCase())
+          .toSet();
+      if (parentScopes.length != 1) {
+        Log.warning('=> 多个电池不在同一父作用域，无法创建单一 BATC 逻辑设备。');
+        return;
+      }
+      bool hasMethod(Map<String, dynamic> battery, String name) {
+        final methods = battery['methods'] as List<dynamic>? ?? const [];
+        return methods.any(
+          (method) => (method['name'] ?? '').toString().toUpperCase() == name,
+        );
+      }
+
+      final allBif = batteryDevices.every(
+        (battery) => hasMethod(battery, '_BIF'),
+      );
+      final allBix = batteryDevices.every(
+        (battery) => hasMethod(battery, '_BIX'),
+      );
+      if (!allBif && !allBix) {
+        Log.warning('=> 多个电池未提供一致的 _BIX 或 _BIF 接口，无法安全合并包结构。');
+        return;
+      }
+    }
+
+    Log(isMultiBattery ? "正在分析多电池依赖..." : "正在分析单电池依赖...");
+    await Log.yieldToUi();
+    final (
+      dependencyTable,
+      relatedMethods,
+      relatedFields,
+      usedMutexNames,
+    ) = _buildBatteryDependencyTable(
+      batteryDevices: batteryDevices,
+      ecDevices: ecDevices,
+      entryMethods: batteryMethods,
+      includeAllReachableMethods: isMultiBattery,
+    );
+    await _logBatteryDependencyTable(dependencyTable);
+
+    if (dependencyTable.isEmpty) {
+      Log.warning("=> 电池依赖表T为空,已终止操作!");
+      return;
+    }
+
+    if (relatedFields.isNotEmpty) {
+      Log("=> 电池依赖方法中检测到 ${relatedFields.length} 个宽字节(超过8字节)字段:");
+      for (final field in relatedFields.values) {
+        final name = field["name"] as String;
+        final bitLen = field["bitLength"] as int;
+        final byteLen = field["byteLength"] as int;
+        final off =
+            (field["originOffset"] as int? ?? 0) +
+            (field["offset"] as int? ?? 0);
+        final rawSpace = (field["regionSpace"] ?? "").toString();
+        final space = rawSpace.isEmpty ? "EmbeddedControl" : rawSpace;
+        Log(
+          "   $name: ${bitLen}bit, ${byteLen}B, $space@${util.hexy(off, padTo: 2)}",
+        );
+      }
+    } else {
+      Log("=> 电池依赖方法中未检测到宽字节(超过8字节)字段!");
+      if (!isMultiBattery) {
+        Log("=> 单电池无需热补丁!已终止操作!");
+        return;
+      }
+    }
+
+    // 依赖方法检测 Symbol（用于 External 与 Mutex patch 等）
+    Log("正在分析电池依赖方法...");
+    final relatedMethodTexts = relatedMethods.values
+        .expand(_relatedMethodOrigins)
+        .map((e) => (e["text"] ?? "").toString())
+        .where((e) => e.isNotEmpty)
+        .toList();
+    final usedSymbols = _extractUsedSymbols(relatedMethodTexts);
+    // 提取所有方法中使用的所有符号
+    debugPrint("=> 所有方法中使用的符号: $usedSymbols");
+    await Log.yieldToUi();
+
+    // 4. 处理多电池情况
+    if (batteryDevices.length > 1) {
+      await _handleMultiBatteryCase(
+        batteryDevices: batteryDevices,
+        ecDevices: ecDevices,
+        usedSymbols: usedSymbols,
+        relatedMethods: relatedMethods,
+        usedFields: relatedFields.values.toList(),
+        usedMutexNames: usedMutexNames,
+        ssdtName: "SSDT-BATC",
+      );
+    }
+    // 5. 处理单电池情况
+    else if (batteryDevices.length == 1) {
+      await _handleSingleBatteryCase(
+        batteryDevice: batteryDevices.first,
+        ecDevices: ecDevices,
+        relatedMethods: relatedMethods,
+        usedFields: relatedFields.values.toList(),
+        usedSymbols: usedSymbols,
+        usedMutexNames: usedMutexNames,
+        ssdtName: "SSDT-BAT",
+      );
+    } else {
+      Log.warning("=> 未找到电池设备（需包含 _STA/_BST/_BIX 或 _BIF）,已终止操作!");
+    }
+  }
+
+  /// 解析 ACPI 整数字面量
+  /// [raw] 原始字符串
+  /// [defaultValue] 默认值
+  int _parseAcpiIntegerLiteral(String raw, {int defaultValue = 0}) {
+    return _tryParseAcpiIntegerLiteral(raw) ?? defaultValue;
+  }
+
+  int? _tryParseAcpiIntegerLiteral(String raw) {
+    final s = raw.trim();
+    if (s.isEmpty) return null;
+
+    final lower = s.toLowerCase();
+    if (lower == "zero") return 0;
+    if (lower == "one") return 1;
+
+    if (lower.startsWith("0x")) {
+      return int.tryParse(lower.substring(2), radix: 16);
+    }
+
+    return int.tryParse(s);
+  }
+
+  /// 从 Scope 行中收集所有对象
+  /// [lines] Scope 行
+  /// [scopePath] Scope 路径
+  /// [names] Name 对象列表
+  /// [methods] Method 对象列表
+  /// [operationRegions] OperationRegion 对象列表
+  /// [scopeFields] ScopeField 对象列表
+  void _collectScopeObjectsFromLines({
+    required List<String> lines,
+    required String scopePath,
+    required List<Map<String, dynamic>> names,
+    required List<Map<String, dynamic>> methods,
+    required List<Map<String, dynamic>> operationRegions,
+    required List<Map<String, dynamic>> scopeFields,
+    required List<String> devices,
+    required List<Map<String, dynamic>> mutexs,
+    bool collectNestedFieldLayouts = false,
+  }) {
+    int depth = 0;
+
+    // 找到 scope 起始
+    int startIndex = lines.indexWhere((l) => l.contains("{"));
+    if (startIndex == -1) {
+      startIndex = 0;
+      depth = 1;
+    } else {
+      startIndex++;
+      depth = 1;
+    }
+
+    int findMatchingBrace(int fromIndex) {
+      int b = 0;
+      for (int j = fromIndex; j < lines.length; j++) {
+        for (final ch in lines[j].split('')) {
+          if (ch == '{') b++;
+          if (ch == '}') {
+            if (b == 0) return j;
+            b--;
+            if (b == 0) return j;
+          }
+        }
+      }
+      return lines.length - 1;
+    }
+
+    int findBlockEnd(int from) {
+      int braceStart = from;
+      while (braceStart < lines.length && !lines[braceStart].contains("{")) {
+        braceStart++;
+      }
+      if (braceStart >= lines.length) return from;
+      return findMatchingBrace(braceStart);
+    }
+
+    int i = startIndex;
+
+    while (i < lines.length) {
+      final raw = lines[i];
+      final line = raw.trim();
+
+      // ---------------- Device ----------------
+      final deviceMatch = RegExp(
+        r'^\s*Device\s*\(\s*([A-Za-z0-9_]+)\s*\)',
+        caseSensitive: false,
+      ).firstMatch(raw);
+
+      if (deviceMatch != null && depth == 1) {
+        devices.add(raw.trim());
+        i = findBlockEnd(i) + 1;
+        continue;
+      }
+
+      if (depth == 1 || collectNestedFieldLayouts) {
+        // ---------------- Name ----------------
+        if (depth == 1 && line.startsWith("Name (")) {
+          final buffer = StringBuffer();
+          int paren = 0;
+          bool started = false;
+          int t = i;
+
+          for (; t < lines.length; t++) {
+            final current = lines[t];
+            buffer.writeln(current);
+            for (final ch in current.split('')) {
+              if (ch == '(') {
+                paren++;
+                started = true;
+              } else if (ch == ')') {
+                paren--;
+              }
+            }
+            if (started && paren == 0) break;
+          }
+
+          final text = buffer.toString().trim();
+          names.add({
+            "text": text,
+            "type": d.detectNameType(text),
+            "name": line.split("(")[1].split(",")[0].trim().toUpperCase(),
+            "scope": scopePath,
+          });
+
+          i = t + 1;
+          continue;
+        }
+
+        // ---------------- OperationRegion ----------------
+        if (line.startsWith("OperationRegion")) {
+          final buffer = StringBuffer();
+          var parenDepth = 0;
+          var started = false;
+          var quoted = false;
+          var end = i;
+          for (; end < lines.length; end++) {
+            final current = lines[end];
+            buffer.writeln(current);
+            for (var charIndex = 0; charIndex < current.length; charIndex++) {
+              final ch = current[charIndex];
+              if (ch == '"' &&
+                  (charIndex == 0 || current[charIndex - 1] != r'\')) {
+                quoted = !quoted;
+              }
+              if (quoted) continue;
+              if (ch == '(') {
+                parenDepth++;
+                started = true;
+              } else if (ch == ')') {
+                parenDepth--;
+              }
+            }
+            if (started && parenDepth <= 0) break;
+          }
+
+          final operationText = buffer.toString().trim();
+          final open = operationText.indexOf('(');
+          final close = operationText.lastIndexOf(')');
+          final args = <String>[];
+          if (open >= 0 && close > open) {
+            final source = operationText.substring(open + 1, close);
+            var argumentStart = 0;
+            var nested = 0;
+            quoted = false;
+            for (var charIndex = 0; charIndex < source.length; charIndex++) {
+              final ch = source[charIndex];
+              if (ch == '"' &&
+                  (charIndex == 0 || source[charIndex - 1] != r'\')) {
+                quoted = !quoted;
+              }
+              if (quoted) continue;
+              if ('([{'.contains(ch)) nested++;
+              if (')]}'.contains(ch)) nested--;
+              if (ch == ',' && nested == 0) {
+                args.add(source.substring(argumentStart, charIndex).trim());
+                argumentStart = charIndex + 1;
+              }
+            }
+            args.add(source.substring(argumentStart).trim());
+          }
+
+          String regionName = "";
+          String regionSpace = "";
+          int offset = 0;
+          int length = 0;
+          String? offsetExpression;
+
+          if (args.length >= 4) {
+            regionName = args[0];
+            regionSpace = args[1];
+            final rawOffset = args[2];
+            final parsedOffset = _tryParseAcpiIntegerLiteral(rawOffset);
+            offset = parsedOffset ?? 0;
+            length = _parseAcpiIntegerLiteral(args[3]);
+            final supportedSpace = regionSpace.toLowerCase();
+            if (parsedOffset == null &&
+                (supportedSpace == "embeddedcontrol" ||
+                    supportedSpace == "systemmemory")) {
+              offsetExpression = rawOffset;
+              final warning =
+                  "$scopePath 的 $regionSpace OperationRegion $regionName 使用动态起始地址 $rawOffset；将保留该 TermArg，并按 Field 相对偏移生成访问地址。";
+              if (_batteryRegionWarnings.add(warning)) Log.warning(warning);
+            }
+          }
+
+          operationRegions.add({
+            "text": operationText,
+            "type": "OperationRegion",
+            "name": regionName,
+            "space": regionSpace,
+            "offset": offset,
+            "offsetExpression": offsetExpression,
+            "length": length,
+            "scope": scopePath,
+          });
+
+          i = end + 1;
+          continue;
+        }
+
+        // ---------------- Field ----------------
+        if (line.startsWith("Field (") || line.startsWith("IndexField (")) {
+          final end = findBlockEnd(i);
+          final buffer = StringBuffer();
+          for (int t = i; t <= end; t++) {
+            buffer.writeln(lines[t]);
+          }
+          final fieldText = buffer.toString().trim();
+
+          final match = RegExp(
+            r'^\s*(Field|IndexField)\s*\(([^)]*)\)',
+          ).firstMatch(fieldText);
+
+          String regionName = "";
+          String accessType = "";
+          String lockRule = "";
+          String updateRule = "";
+
+          if (match != null) {
+            final args = match
+                .group(2)!
+                .split(',')
+                .map((e) => e.trim())
+                .toList();
+
+            if (args.length >= 4) {
+              regionName = args[0];
+              accessType = args[args.length - 3];
+              lockRule = args[args.length - 2];
+              updateRule = args[args.length - 1];
+            }
+          }
+
+          scopeFields.add({
+            "text": fieldText,
+            "type": "FieldUnitObj",
+            "indexed": (match?.group(1) ?? "").toLowerCase() == "indexfield",
+            "regionName": regionName,
+            "accessType": accessType,
+            "lockRule": lockRule,
+            "updateRule": updateRule,
+            "fields": _parseFieldBlock(scopePath, fieldText),
+            "scope": scopePath,
+          });
+
+          i = end + 1;
+          continue;
+        }
+
+        // ---------------- Method ----------------
+        if (depth == 1 && line.startsWith("Method (")) {
+          final end = findBlockEnd(i);
+          final buffer = StringBuffer();
+          for (int t = i; t <= end; t++) {
+            buffer.writeln(lines[t]);
+          }
+          final methodText = buffer.toString().trim();
+
+          final match = RegExp(
+            r'^\s*Method\s*\(\s*([A-Za-z0-9_]+)\s*,\s*([0-9]+)\s*,\s*([A-Za-z]+)\s*\)',
+            caseSensitive: false,
+          ).firstMatch(methodText);
+
+          // 提取方法中使用的字段，分为宽字节和普通字段
+          final wideFields = <Map<String, dynamic>>[];
+          final normalFields = <Map<String, dynamic>>[];
+          final usedSymbols = _extractUsedSymbols([methodText]);
+          final usedFieldNames = usedSymbols.map((e) => e['name']).toList();
+
+          // 检查所有字段，看是否被方法使用
+          for (final fieldBlock in scopeFields) {
+            final fieldMap = fieldBlock["fields"] as List<dynamic>;
+            for (final field in fieldMap) {
+              final fieldName = field["name"] as String;
+              if (usedFieldNames.contains(fieldName.toUpperCase())) {
+                final bitLength = field["bitLength"] as int? ?? 0;
+                final byteLength = field["byteLength"] as int? ?? 1;
+                if (bitLength > 8 || byteLength > 1) {
+                  wideFields.add(field);
+                } else {
+                  normalFields.add(field);
+                }
+              }
+            }
+          }
+
+          methods.add({
+            "text": methodText,
+            "type": "MethodObj",
+            "name": match?.group(1) ?? "",
+            "argCount": int.tryParse(match?.group(2) ?? "0") ?? 0,
+            "flags": match?.group(3) ?? "NotSerialized",
+            "line": i,
+            "wideFields": wideFields,
+            "normalFields": normalFields,
+            "scope": scopePath,
+          });
+
+          i = end + 1;
+          continue;
+        }
+
+        // ---------------- Mutex ----------------
+        if (depth == 1 && line.startsWith("Mutex (")) {
+          final match = RegExp(
+            r'^\s*Mutex\s*\(\s*([A-Za-z0-9_]+)\s*,\s*(0x[0-9A-Fa-f]+|[0-9]+)\s*\)',
+            caseSensitive: false,
+          ).firstMatch(raw);
+
+          final levelText = (match?.group(2) ?? "0").trim();
+          final level = levelText.toLowerCase().startsWith("0x")
+              ? (int.tryParse(levelText.substring(2), radix: 16) ?? 0)
+              : (int.tryParse(levelText) ?? 0);
+
+          mutexs.add({
+            "text": raw.trim(),
+            "type": "MutexObj",
+            "name": match?.group(1) ?? "",
+            "level": level,
+            "scope": scopePath,
+          });
+
+          i++;
+          continue;
+        }
+      }
+
+      // -------- depth 更新（更高效版本）--------
+      for (final ch in raw.split('')) {
+        if (ch == '{') depth++;
+        if (ch == '}') depth--;
+      }
+
+      if (depth <= 0) break;
+      i++;
+    }
+  }
+
+  /// 获取设备的所有信息
+  /// [scopeName] Scope 名称
+  /// [scopePath] Scope 路径
+  Map<String, dynamic> getScopeAllInfoWithScopeName({
+    required String scopeName,
+    required String scopePath,
+    Map<String, dynamic>? table,
+    bool collectNestedFieldLayouts = false,
+  }) {
+    table ??= d.getDsdt();
+
+    final names = <Map<String, dynamic>>[];
+    final methods = <Map<String, dynamic>>[];
+    final opRegions = <Map<String, dynamic>>[];
+    final fields = <Map<String, dynamic>>[];
+    final devices = <String>[];
+    final mutexs = <Map<String, dynamic>>[];
+
+    final scopes = d.getScopesOfPath(
+      scopePath: scopeName,
+      table: table,
+      stripComments: true,
+    );
+
+    if (scopes.isEmpty) {
+      return {
+        "valid": false,
+        "path": scopePath,
+        "name": scopeName,
+        "names": names,
+        "methods": methods,
+        "operationRegions": opRegions,
+        "scopeFields": fields,
+        "devices": devices,
+        "mutexs": mutexs,
+      };
+    }
+    for (final scope in scopes) {
+      _collectScopeObjectsFromLines(
+        lines: scope,
+        scopePath: scopePath,
+        names: names,
+        methods: methods,
+        operationRegions: opRegions,
+        scopeFields: fields,
+        devices: devices,
+        mutexs: mutexs,
+        collectNestedFieldLayouts: collectNestedFieldLayouts,
+      );
+    }
+
+    return {
+      "valid": true,
+      "path": scopePath,
+      "name": scopeName,
+      "names": names,
+      "methods": methods,
+      "operationRegions": opRegions,
+      "scopeFields": fields,
+      "devices": devices,
+      "mutexs": mutexs,
+      "table": table,
+    };
+  }
+
+  /// 获取设备的所有信息
+  /// [path] 设备路径
+  /// [table] SSDT 表
+  Map<String, dynamic> _getBatteryDeviceAllInfo({
+    required String path,
+    Map<String, dynamic>? table,
+    int? startingIndex,
+    bool collectNestedFieldLayouts = false,
+  }) {
+    table ??= d.getDsdt();
+    String name = path.split(".").last;
+    final names = <Map<String, dynamic>>[];
+    final methods = <Map<String, dynamic>>[];
+    final opRegions = <Map<String, dynamic>>[];
+    final fields = <Map<String, dynamic>>[];
+    final devices = <String>[];
+    final mutexs = <Map<String, dynamic>>[];
+
+    final scope = startingIndex == null
+        ? d.getScopeOfDevice(
+            devicePath: path,
+            table: table,
+            stripComments: true,
+          )
+        : d.getScope(
+            startingIndex: startingIndex,
+            table: table,
+            stripComments: true,
+          );
+
+    if (scope.isEmpty) {
+      Log("=> 未找到设备 $path 的 Scope");
+      return {
+        "valid": false,
+        "path": path,
+        "name": name,
+        "names": names,
+        "methods": methods,
+        "operationRegions": opRegions,
+        "scopeFields": fields,
+        "devices": devices,
+        "mutexs": mutexs,
+      };
+    }
+
+    _collectScopeObjectsFromLines(
+      lines: scope,
+      scopePath: path,
+      names: names,
+      methods: methods,
+      operationRegions: opRegions,
+      scopeFields: fields,
+      devices: devices,
+      mutexs: mutexs,
+      collectNestedFieldLayouts: collectNestedFieldLayouts,
+    );
+
+    final usesSystemMemory = RegExp(
+      r'OperationRegion\s*\([^,]+,\s*SystemMemory\s*,',
+      caseSensitive: false,
+    ).hasMatch(scope.join("\n"));
+
+    // 校验 _STA 是否仅返回 Zero
+    final valid = !methods.any((m) {
+      final name = (m["name"] ?? "").toString().toUpperCase();
+      if (name != "_STA") return false;
+
+      final text = (m["text"] ?? "").toString();
+      return isMethodOnlyReturnZero(text);
+    });
+
+    return {
+      "valid": valid,
+      "path": path,
+      "name": name,
+      "names": names,
+      "methods": methods,
+      "operationRegions": opRegions,
+      "scopeFields": fields,
+      "devices": devices,
+      "mutexs": mutexs,
+      "usesSystemMemory": usesSystemMemory,
+    };
+  }
+
+  /// 从方法文本中提取所有 Return 语句的值
+  /// [methodText] 方法文本
+  /// 返回所有 Return 语句的值列表
+  List<String> extractReturns(String methodText) {
+    return RegExp(r'Return\s*\(\s*([^)]+)\s*\)', caseSensitive: false)
+        .allMatches(methodText)
+        .map((e) => e.group(1)!.trim().toUpperCase())
+        .toList();
+  }
+
+  /// 判断值是否为 Zero
+  /// [value] 值
+  /// 返回是否为 Zero
+  bool isZeroValue(String value) {
+    return RegExp(r'^(ZERO|0X0+|0)$', caseSensitive: false).hasMatch(value);
+  }
+
+  /// 判断任意方法是否仅 Return(Zero)
+  bool isMethodOnlyReturnZero(String methodText) {
+    final returns = extractReturns(methodText);
+
+    if (returns.isEmpty) return false;
+
+    return returns.every(isZeroValue);
+  }
+
+  /// 解析 Field 块，提取字段信息
+  List<Map<String, dynamic>> _parseFieldBlock(String path, String fieldBlock) {
+    final fields = <Map<String, dynamic>>[];
+
+    // 找到 Field 块的大括号内容
+    final start = fieldBlock.indexOf("{");
+    final end = fieldBlock.lastIndexOf("}");
+    if (start < 0 || end <= start) return fields;
+
+    final body = fieldBlock.substring(start + 1, end).trim();
+    // 按行分割，保留逗号
+    final lines = body
+        .split(RegExp(r'[\n\r]+'))
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+
+    int bitOffset = 0;
+    for (final line in lines) {
+      // 处理 Offset 指令
+      if (line.toLowerCase().startsWith("offset")) {
+        final offsetMatch = RegExp(
+          r'Offset\s*\(\s*([0-9xA-Fa-f]+)\s*\)',
+        ).firstMatch(line);
+        if (offsetMatch != null) {
+          final offsetStr = offsetMatch.group(1);
+          if (offsetStr != null) {
+            int offset = 0;
+            if (offsetStr.startsWith("0x")) {
+              offset = int.tryParse(offsetStr.substring(2), radix: 16) ?? 0;
+            } else {
+              offset = int.tryParse(offsetStr) ?? 0;
+            }
+            bitOffset = offset * 8;
+          }
+        }
+        continue;
+      }
+
+      // 跳过访问控制指令
+      if (line.toLowerCase().startsWith("accessas") ||
+          line.toLowerCase().startsWith("connection") ||
+          line.toLowerCase().startsWith("lock") ||
+          line.toLowerCase().startsWith("update")) {
+        continue;
+      }
+
+      // 按逗号分割字段定义
+      final fieldDefs = line.split(',').map((e) => e.trim()).toList();
+
+      // 每两个元素组成一个字段定义（字段名 + 位长）
+      for (int i = 0; i < fieldDefs.length; i += 2) {
+        if (i + 1 < fieldDefs.length) {
+          final fieldName = fieldDefs[i];
+          final lengthStr = fieldDefs[i + 1];
+
+          // 跳过空长度
+          if (lengthStr.isEmpty) continue;
+
+          int bitLength = 8; // 默认位长
+          if (lengthStr.startsWith("0x")) {
+            bitLength = int.tryParse(lengthStr.substring(2), radix: 16) ?? 8;
+          } else {
+            bitLength = int.tryParse(lengthStr) ?? 8;
+          }
+
+          final byteOffset = bitOffset ~/ 8;
+          final bitInByte = bitOffset % 8;
+          final byteSize = ((bitInByte + bitLength) + 7) ~/ 8;
+
+          fields.add({
+            "name": fieldName,
+            "bitLength": bitLength,
+            "byteLength": byteSize,
+            "offset": byteOffset,
+            "bitOffset": bitOffset,
+            "scope": path,
+          });
+
+          // Log(
+          //   "=> 解析字段: $fieldName, bitLength: $bitLength, offset: 0x${byteOffset.toRadixString(16)}, bitOffset: 0x${bitOffset.toRadixString(16)}",
+          // );
+
+          bitOffset += bitLength;
+        }
+      }
+    }
+
+    return fields;
+  }
+
+  /// 查找所有符合条件的电池设备
+  /// 查找所有符合条件的电池设备（包含 _STA/_BST/_BIX 或 _BIF 方法）
+  /// 返回符合条件的电池设备列表
+  List<Map<String, dynamic>> _findBatteryDevices() {
+    final devices = <Map<String, dynamic>>[];
+    for (final tableName in sortedNicely(d.acpiTables.keys.toList())) {
+      final table = d.acpiTables[tableName];
+      if (table == null) continue;
+
+      final batteries = d.getDevicePathsWithHid(hid: "PNP0C0A", table: table);
+      if (batteries.isEmpty) continue;
+      Log("=> 在 $tableName 中检测到 ${batteries.length} 个电池设备:");
+      for (final bat in batteries) {
+        Log("=> 电池设备: ${bat[0]}");
+      }
+      Log("正在筛选有效电池设备...");
+      for (final bat in batteries) {
+        final path = bat[0].toString();
+        final info = _getBatteryDeviceAllInfo(
+          path: path,
+          table: table,
+          startingIndex: bat[1] as int?,
+        );
+        final parentPath = path
+            .split(".")
+            .sublist(0, path.split(".").length - 1)
+            .join(".");
+
+        final name = path.split(".").last;
+        final methods = info["methods"] as List<Map<String, dynamic>>? ?? [];
+        bool hasSTA = false;
+        bool hasBST = false;
+        bool hasBif = false;
+        bool hasBix = false;
+        // 检查电池设备是否包含必要的方法
+        for (final m in methods) {
+          final name = m["name"] as String? ?? "";
+          if (name == "_STA") hasSTA = true;
+          if (name == "_BST") hasBST = true;
+          if (name == "_BIF") hasBif = true;
+          if (name == "_BIX") hasBix = true;
+        }
+        final hasBixOrBif = hasBif || hasBix;
+
+        if (hasSTA && hasBST && hasBixOrBif) {
+          Log("=> 电池设备 $path 包含必要的方法（_STA/_BST/_BIX 或 _BIF）,有效电池!");
+          devices.add({
+            "valid": true,
+            "name": name,
+            "path": path,
+            "names": info["names"] ?? [],
+            "methods": methods,
+            "mutexs": info["mutexs"] ?? [],
+            "usesSystemMemory": info["usesSystemMemory"] == true,
+            "scope": parentPath,
+            "table": table,
+          });
+        } else {
+          Log.warning(
+            "=> 电池设备 $path 不包含必要的方法（_STA/_BST/_BIX 或 _BIF）,无效电池,已跳过!",
+          );
+        }
+      }
+    }
+    return devices;
+  }
+
+  /// 查找所有符合条件的EC设备
+  /// 返回符合条件的EC设备列表
+  List<Map<String, dynamic>> _findECDevices() {
+    final tableNames = sortedNicely(d.acpiTables.keys.toList());
+
+    // 按 EC 设备绝对路径聚合所有表中的 Scope 信息。
+    // 即便某个 SSDT/SSDT-x 中没有 PNP0C09 设备定义，也可能存在
+    // Scope(\_SB....ECx) 的方法/字段，因此不能只在“找到设备的表”里解析 Scope
+    final ecByPath = <String, Map<String, dynamic>>{};
+
+    void mergeListUnique({
+      required List<dynamic> into,
+      required List<dynamic> incoming,
+      required String Function(dynamic item) keyOf,
+    }) {
+      final seen = <String>{};
+      for (final it in into) {
+        seen.add(keyOf(it));
+      }
+      for (final it in incoming) {
+        final k = keyOf(it);
+        if (seen.add(k)) into.add(it);
+      }
+    }
+
+    // 1) 第一次扫描：找出所有有效 EC 设备（PNP0C09）
+    for (final tableName in tableNames) {
+      final table = d.acpiTables[tableName];
+      if (table == null) continue;
+
+      final ecDevices = d.getDevicePathsWithHid(hid: "PNP0C09", table: table);
+      if (ecDevices.isEmpty) continue;
+      Log(
+        "=> 在 $tableName 中检测到 ${ecDevices.length} 个EC设备:",
+        level: ecDevices.length > 1 ? LogLevel.warning : LogLevel.debug,
+      );
+
+      for (final ec in ecDevices) {
+        Log("=> EC设备: ${ec[0]}");
+      }
+
+      for (final ec in ecDevices) {
+        final ecPath = ec[0].toString();
+        final parentPath = ecPath
+            .split(".")
+            .sublist(0, ecPath.split(".").length - 1)
+            .join(".");
+
+        final ecInfo = _getBatteryDeviceAllInfo(
+          path: ecPath,
+          table: table,
+          startingIndex: ec[1] as int?,
+          collectNestedFieldLayouts: true,
+        );
+        if (!(ecInfo['valid'] ?? false)) {
+          Log.warning("=> EC设备 $ecPath 无效,已跳过!");
+          continue;
+        }
+
+        final entry = ecByPath.putIfAbsent(ecPath, () {
+          return {
+            "valid": true,
+            "name": ecInfo["name"] as String? ?? "",
+            "path": ecPath,
+            "names": <dynamic>[],
+            "operationRegions": <dynamic>[],
+            "scopeFields": <dynamic>[],
+            "methods": <dynamic>[],
+            "mutexs": <dynamic>[],
+            "scope": parentPath,
+            // 记录首次发现该 EC 设备的表，便于调试
+            "table": table,
+          };
+        });
+
+        // 设备体内信息
+        mergeListUnique(
+          into: entry["names"],
+          incoming: ecInfo["names"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["operationRegions"],
+          incoming: ecInfo["operationRegions"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["scopeFields"],
+          incoming: ecInfo["scopeFields"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["regionName"] ?? "").toString().toUpperCase()}:${(m["text"] ?? "").toString()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["methods"],
+          incoming: ecInfo["methods"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["mutexs"],
+          incoming: ecInfo["mutexs"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+      }
+    }
+
+    if (ecByPath.isEmpty) return <Map<String, dynamic>>[];
+
+    // 2) 第二次扫描：对每个有效 EC 设备，在所有表中继续收集 Scope(....ECx) 信息
+    for (final tableName in tableNames) {
+      final table = d.acpiTables[tableName];
+      if (table == null) continue;
+
+      for (final entry in ecByPath.values) {
+        final ecName = (entry["name"] ?? "").toString();
+        final ecPath = (entry["path"] ?? "").toString();
+        if (ecName.isEmpty || ecPath.isEmpty) continue;
+
+        final otherECInfo = getScopeAllInfoWithScopeName(
+          scopeName: ecName,
+          scopePath: ecPath,
+          table: table,
+          collectNestedFieldLayouts: true,
+        );
+        if (otherECInfo.isEmpty || !(otherECInfo["valid"] ?? false)) continue;
+
+        mergeListUnique(
+          into: entry["names"],
+          incoming: otherECInfo["names"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["operationRegions"],
+          incoming:
+              otherECInfo["operationRegions"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["scopeFields"],
+          incoming: otherECInfo["scopeFields"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["regionName"] ?? "").toString().toUpperCase()}:${(m["text"] ?? "").toString()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["methods"],
+          incoming: otherECInfo["methods"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+        mergeListUnique(
+          into: entry["mutexs"],
+          incoming: otherECInfo["mutexs"] as List<dynamic>? ?? const [],
+          keyOf: (it) {
+            final m = (it as Map);
+            return "${(m["scope"] ?? "").toString().toUpperCase()}.${(m["name"] ?? "").toString().toUpperCase()}";
+          },
+        );
+      }
+    }
+
+    final out = ecByPath.values.toList();
+    out.sort(
+      (a, b) =>
+          (a["path"] ?? "").toString().compareTo((b["path"] ?? "").toString()),
+    );
+    return out;
+  }
+
+  /// 生成ACPI配置并写入SSDT
+  Future<void> _generateAcpiConfigAndWriteSsdt({
+    required String ssdtName,
+    required String ssdt,
+    required List<Map<String, String>> patches,
+    required String comment,
+  }) async {
+    final acpi = {"Comment": comment, "Enabled": true, "Path": "$ssdtName.aml"};
+
+    if (await writeSSDT(ssdtName, ssdt)) {
+      makePlist(acpi: acpi, patches: patches, replace: true);
+    } else {
+      Log.error('未写入 $ssdtName 的 ACPI 配置：SSDT 编译失败。');
+    }
+  }
+
+  /// 生成电池相关数据
+  (
+    List<Map<String, String>>,
+    Map<String, String>,
+    Map<String, Map<String, dynamic>>,
+    List<String>,
+    Map<String, String>,
+  )
+  _generateBatteryData({
+    required List<Map<String, dynamic>> batteryDevices,
+    required List<Map<String, dynamic>> ecDevices,
+    required Map<String, Map<String, dynamic>> relatedMethods,
+    required List<Map<String, dynamic>> usedFields,
+    required List<Map<String, String>> usedSymbols,
+    required Set<String> usedMutexNames,
+    required String ssdtName,
+  }) {
+    final List<Map<String, String>> patches = [];
+    final Map<String, String> renameMap = {};
+    final List<String> externals = [];
+    final Map<String, String> wrappers = {};
+
+    // 检查维护表T中使用到的 Mutex 同步等级，非0则生成置0补丁
+    final usedMutexSet = usedMutexNames.map((e) => e.toUpperCase()).toSet();
+    for (final device in [...batteryDevices, ...ecDevices]) {
+      final deviceMutexs = device['mutexs'] as List<dynamic>? ?? const [];
+      if (deviceMutexs.isEmpty) continue;
+
+      for (final m in deviceMutexs) {
+        final mutex = m;
+        final mutexName = (mutex['name'] ?? '').toString().toUpperCase();
+        if (mutexName.isEmpty || !usedMutexSet.contains(mutexName)) continue;
+
+        final level = mutex['level'] as int? ?? 0;
+        if (level == 0) continue;
+
+        final devicePath = (device['path'] ?? device['scope'] ?? '')
+            .toString()
+            .trim();
+        Log("=> $devicePath 中的 ${mutex['text']} 同步等级为 $level,已生成置0补丁!");
+        patches.add({
+          "Comment":
+              "Change Mutex ($mutexName, ${util.hexy(level, padTo: 2)} to 0)",
+          "Find":
+              _nameToHex(mutexName) + level.toRadixString(16).padLeft(2, '0'),
+          "Replace": "${_nameToHex(mutexName)}00",
+        });
+      }
+    }
+
+    for (final batteryDevice in batteryDevices) {
+      // 生成重命名补丁
+      final (patcheList, reMap) = _generateRenamePatches(
+        table: batteryDevice["table"] as Map<String, dynamic>? ?? {},
+        relatedMethods: relatedMethods,
+        ssdtName: ssdtName,
+      );
+
+      if (patcheList.isNotEmpty) {
+        patches.addAll(patcheList);
+      }
+      if (reMap.isNotEmpty) {
+        renameMap.addAll(reMap);
+      }
+    }
+
+    // 构建外部引用
+    final renameTargetsMap = <String, Map<String, dynamic>>{};
+    for (final entry in renameMap.entries) {
+      final renameTarget = entry.value;
+      // 查找原始方法字典
+      final originalMethod = relatedMethods[entry.key];
+      if (originalMethod != null) {
+        renameTargetsMap[renameTarget] = originalMethod;
+      }
+    }
+
+    // 生成方法包装器
+    final wrapperList = _generateMethodWrappers(
+      ecDevices: ecDevices,
+      relatedMethods: relatedMethods,
+      renameMap: renameMap,
+      renameTargetsMap: renameTargetsMap,
+      usedFields: usedFields,
+    );
+    if (wrapperList.isNotEmpty) {
+      wrappers.addAll(wrapperList);
+    }
+
+    final externalList = _buildBatteryExternals(
+      batteryDevices: batteryDevices,
+      ecDevices: ecDevices,
+      usedFields: usedFields,
+      renameTargets: renameTargetsMap,
+      usedSymbols: usedSymbols,
+    );
+
+    if (externalList.isNotEmpty) {
+      externals.addAll(externalList);
+    }
+
+    return (patches, renameMap, renameTargetsMap, externals, wrappers);
+  }
+
+  /// 处理多电池情况，生成电池依赖表并处理重命名
+  Future<void> _handleMultiBatteryCase({
+    required List<Map<String, dynamic>> batteryDevices,
+    required List<Map<String, dynamic>> ecDevices,
+    required List<Map<String, String>> usedSymbols,
+    required Map<String, Map<String, dynamic>> relatedMethods,
+    required List<Map<String, dynamic>> usedFields,
+    required Set<String> usedMutexNames,
+    required String ssdtName,
+  }) async {
+    // 临时变量存储所有电池设备的数据
+    final Map<String, Map<String, String>> patchesMap = {};
+    final Set<String> externalsSet = {};
+    final Map<String, String> renameMap = {};
+    final Map<String, String> methodMap = {};
+    final Map<String, String> wrappersMap = {};
+
+    // 收集所有电池/EC方法文本（用于后续模板/调试）
+    for (final batteryDevice in batteryDevices) {
+      final methods = batteryDevice["methods"] as List<dynamic>? ?? const [];
+      for (final m in methods) {
+        final mm = m;
+        final name = (mm["name"] ?? "").toString().toUpperCase();
+        final text = (mm["text"] ?? "").toString();
+        if (name.isNotEmpty && text.isNotEmpty) {
+          methodMap[name] = text;
+        }
+      }
+    }
+    for (final ecDevice in ecDevices) {
+      final methods = ecDevice["methods"] as List<dynamic>? ?? const [];
+      for (final m in methods) {
+        final mm = m;
+        final name = (mm["name"] ?? "").toString().toUpperCase();
+        final text = (mm["text"] ?? "").toString();
+        if (name.isNotEmpty && text.isNotEmpty) {
+          methodMap[name] = text;
+        }
+      }
+    }
+
+    // 生成电池相关数据
+    final (
+      devicePatches,
+      deviceRenameMap,
+      renameTargetsMap,
+      deviceExternals,
+      deviceWrappers,
+    ) = _generateBatteryData(
+      batteryDevices: batteryDevices,
+      ecDevices: ecDevices,
+      relatedMethods: relatedMethods,
+      usedFields: usedFields,
+      usedSymbols: usedSymbols,
+      usedMutexNames: usedMutexNames,
+      ssdtName: ssdtName,
+    );
+
+    // 汇总补丁，使用 Find 值作为键去重
+    if (devicePatches.isNotEmpty) {
+      for (final patch in devicePatches) {
+        final patchKey = patch["Find"];
+        if (patchKey != null) {
+          patchesMap[patchKey] = patch;
+        }
+      }
+    }
+
+    // 汇总重命名映射
+    if (deviceRenameMap.isNotEmpty) {
+      renameMap.addAll(deviceRenameMap);
+    }
+
+    // 汇总外部引用
+    if (deviceExternals.isNotEmpty) {
+      externalsSet.addAll(deviceExternals);
+    }
+
+    // 汇总包装器
+    if (deviceWrappers.isNotEmpty) {
+      wrappersMap.addAll(deviceWrappers);
+    }
+
+    if (renameMap.isNotEmpty) {
+      Log("=> 电池依赖方法: ${renameMap.keys.join(', ')}");
+    } else {
+      Log("=> 电池依赖方法为空!");
+      Log("准备合并当前 ${batteryDevices.length} 个电池设备...");
+    }
+    // 打印补丁
+    for (final entry in renameMap.entries) {
+      Log("=> 生成重命名补丁: ${entry.key} -> ${entry.value}");
+    }
+
+    // 转换为列表
+    final patches = patchesMap.values.toList();
+    final externals = externalsSet.toList();
+
+    // 生成外部引用行
+    final externalLines = externals.map((x) => "    $x").join("\n");
+    debugPrint(externalLines);
+
+    // 构建SSDT
+    String ssdt = _buildMultiBatterySsdt(
+      batteryDevices: batteryDevices,
+      ecDevices: ecDevices,
+      relatedMethods: relatedMethods,
+      renameMap: renameMap,
+      renameTargetsMap: renameTargetsMap,
+      methodBlocks: methodMap,
+      usedFields: usedFields,
+      externalLines: externalLines,
+      ssdtName: ssdtName,
+    );
+
+    final batteryNames = batteryDevices
+        .map((e) => e["name"] as String)
+        .toList();
+    // 生成ACPI配置并写入SSDT
+    await _generateAcpiConfigAndWriteSsdt(
+      ssdtName: ssdtName,
+      ssdt: ssdt,
+      patches: patches,
+      comment:
+          "Multi-battery logical merge for Darwin (${batteryNames.join('+')})",
+    );
+  }
+
+  /// 处理单电池情况
+  Future<void> _handleSingleBatteryCase({
+    required Map<String, dynamic> batteryDevice,
+    required List<Map<String, dynamic>> ecDevices,
+    required Map<String, Map<String, dynamic>> relatedMethods,
+    required List<Map<String, dynamic>> usedFields,
+    required List<Map<String, String>> usedSymbols,
+    required Set<String> usedMutexNames,
+    required String ssdtName,
+  }) async {
+    // 生成电池相关数据
+    final (
+      patches,
+      renameMap,
+      renameTargetsMap,
+      externals,
+      wrappers,
+    ) = _generateBatteryData(
+      batteryDevices: [batteryDevice],
+      ecDevices: ecDevices,
+      relatedMethods: relatedMethods,
+      usedFields: usedFields,
+      usedSymbols: usedSymbols,
+      usedMutexNames: usedMutexNames,
+      ssdtName: ssdtName,
+    );
+    if (renameMap.isNotEmpty) {
+      Log("=> 电池依赖方法: ${renameMap.keys.join(', ')}");
+    } else {
+      Log("=> 电池依赖方法为空!无需热补丁,已终止操作!");
+      return;
+    }
+    // 打印补丁
+    for (final entry in renameMap.entries) {
+      Log("=> 生成重命名补丁: ${entry.key} -> ${entry.value}");
+    }
+
+    final externalLines = externals.map((x) => "    $x").join("\n");
+    debugPrint(externalLines);
+    // 构建SSDT
+    final String ssdt = _buildSingleBatterySsdt(
+      ecDevices: ecDevices,
+      relatedMethods: relatedMethods,
+      externalLines: externalLines,
+      wrappers: wrappers,
+      usedFields: usedFields,
+    );
+
+    // 生成ACPI配置并写入SSDT
+    await _generateAcpiConfigAndWriteSsdt(
+      ssdtName: ssdtName,
+      ssdt: ssdt,
+      patches: patches,
+      comment: "Battery EC hotpatch (${batteryDevice['path']})",
+    );
+  }
+
+  /// 获取同名方法在不同 ACPI 作用域中的所有来源。
+  List<Map<String, dynamic>> _relatedMethodOrigins(
+    Map<String, dynamic> method,
+  ) {
+    final rawOrigins = method["origins"] as List<dynamic>?;
+    if (rawOrigins == null || rawOrigins.isEmpty) return [method];
+    return rawOrigins
+        .whereType<Map>()
+        .map((origin) => Map<String, dynamic>.from(origin))
+        .toList();
+  }
+
+  /// 生成 Method Rename 补丁
+  (List<Map<String, String>>, Map<String, String>) _generateRenamePatches({
+    required Map<String, dynamic> table,
+    required Map<String, Map<String, dynamic>> relatedMethods,
+    required String ssdtName,
+  }) {
+    final patches = <Map<String, String>>[];
+    final renameMap = <String, String>{};
+
+    final usedNewNames = <String>{};
+    final orderedMethodNames = relatedMethods.keys.toList()
+      ..sort((a, b) {
+        final au = a.toUpperCase();
+        final bu = b.toUpperCase();
+        final aIsStd = au.startsWith('_');
+        final bIsStd = bu.startsWith('_');
+        if (aIsStd != bIsStd) return aIsStd ? -1 : 1;
+        return au.compareTo(bu);
+      });
+
+    for (final methodName in orderedMethodNames) {
+      final info = relatedMethods[methodName]!;
+      final origins = _relatedMethodOrigins(info);
+
+      // A renamed method is installed in the original method's scope.  Avoid
+      // colliding with firmware objects already declared there (for example,
+      // some Lenovo tables contain Name (XBIF, Package (...)) next to _BIF).
+      final unavailableNames = <String>{...usedNewNames};
+      for (final origin in origins) {
+        final methodScopeKey = BatteryExternalNormalizer.pathKey(
+          (origin["scope"] ?? '').toString(),
+        );
+        for (final object in _batteryNamespaceObjects) {
+          final objectKey = BatteryExternalNormalizer.pathKey(object.path);
+          final segments = objectKey.split('.');
+          if (segments.isEmpty) continue;
+          final objectScopeKey = segments.length == 1
+              ? ''
+              : segments.sublist(0, segments.length - 1).join('.');
+          if (objectScopeKey == methodScopeKey) {
+            unavailableNames.add(segments.last);
+          }
+        }
+      }
+
+      /// 新 Method
+      final baseName = _renamedMethodName(methodName);
+      final newMethodName = _renamedMethodName(
+        methodName,
+        usedNames: unavailableNames,
+      );
+      if (newMethodName != baseName) {
+        Log.warning(
+          "=> 检测到重命名冲突: $methodName -> $baseName 已占用, 自动调整为 $newMethodName",
+        );
+      }
+      usedNewNames.add(newMethodName);
+
+      final emittedSignatures = <String>{};
+      for (final origin in origins) {
+        final argCount = origin["argCount"] as int? ?? 0;
+        final serialized = origin["flags"] == 'Serialized';
+        final flags = argCount + (serialized ? 8 : 0);
+        final flagsHex = flags.toRadixString(16).padLeft(2, '0').toUpperCase();
+        final oldHex = _nameToHex(methodName) + flagsHex;
+        if (!emittedSignatures.add(oldHex)) continue;
+        final newHex = _nameToHex(newMethodName) + flagsHex;
+        patches.add({
+          "Comment":
+              "Method ($methodName,$argCount,${serialized ? 'S' : 'N'}) to $newMethodName rename - requires $ssdtName.aml",
+          "Find": oldHex,
+          "Replace": newHex,
+        });
+      }
+
+      renameMap[methodName] = newMethodName;
+    }
+
+    return (patches, renameMap);
+  }
+
+  /// 生成方法包装器
+  Map<String, String> _generateMethodWrappers({
+    required List<Map<String, dynamic>> ecDevices,
+    required Map<String, Map<String, dynamic>> relatedMethods,
+    required Map<String, String> renameMap,
+    required Map<String, Map<String, dynamic>> renameTargetsMap,
+    required List<Map<String, dynamic>> usedFields,
+  }) {
+    final wrappers = <String, String>{};
+
+    for (final methodName in relatedMethods.keys) {
+      final renameTarget = renameMap[methodName];
+      if (renameTarget == null) continue;
+      final origins = _relatedMethodOrigins(relatedMethods[methodName]!);
+      for (var index = 0; index < origins.length; index++) {
+        final origin = origins[index];
+        final key = index == 0
+            ? methodName
+            : _methodFullPath((origin["scope"] ?? '').toString(), methodName);
+        wrappers[key] = _buildBatteryMethodWrapper(
+          relatedMethod: origin,
+          renameTarget: renameTarget,
+          renameTargetsMap: renameTargetsMap,
+          usedFields: usedFields,
+        );
+      }
+    }
+
+    return wrappers;
+  }
+
+  String _batteryAbsolutePath(String value) {
+    final path = value.trim();
+    return path.startsWith('\\') ? path : '\\$path';
+  }
+
+  String _buildGenericMultiBatteryDevice(
+    List<Map<String, dynamic>> batteries,
+    String infoMethod,
+  ) {
+    final bix = infoMethod == '_BIX';
+    final power = bix ? 1 : 0;
+    final design = bix ? 2 : 1;
+    final full = bix ? 3 : 2;
+    final voltage = bix ? 5 : 4;
+    final warning = bix ? 6 : 5;
+    final low = bix ? 7 : 6;
+    final fallbackPackageSize = bix ? '0x15' : '0x0D';
+    final hideLines = <String>[];
+    final staLines = <String>[];
+    final infoBlocks = <String>[];
+    final statusBlocks = <String>[];
+
+    String activeBlock(String path, String body) =>
+        '''If (LNotEqual (And ($path._STA (), 0x10), Zero))
+{
+${_indentBlock(body, 4)}
+}''';
+
+    for (final battery in batteries) {
+      final path = _batteryAbsolutePath((battery['path'] ?? '').toString());
+      hideLines.add('''If (CondRefOf ($path._HID))
+{
+    Store (Zero, $path._HID)
+}''');
+      staLines.add('Or (Local0, $path._STA (), Local0)');
+      infoBlocks.add(
+        activeBlock(path, '''Store ($path.$infoMethod (), Local1)
+If (LEqual (Local6, Zero))
+{
+    Store (Local1, Local0)
+    Store (DerefOf (Index (Local1, $power)), Local4)
+    Store (DerefOf (Index (Local1, $voltage)), Local5)
+    Store (One, Index (Local0, $power))
+    Store (CVWA (DerefOf (Index (Local1, $design)), Local5, Local4), Index (Local0, $design))
+    Store (CVWA (DerefOf (Index (Local1, $full)), Local5, Local4), Index (Local0, $full))
+    Store (CVWA (DerefOf (Index (Local1, $warning)), Local5, Local4), Index (Local0, $warning))
+    Store (CVWA (DerefOf (Index (Local1, $low)), Local5, Local4), Index (Local0, $low))
+}
+Else
+{
+    Store (DerefOf (Index (Local1, $power)), Local4)
+    Store (DerefOf (Index (Local1, $voltage)), Local5)
+    Store (Add (DerefOf (Index (Local0, $design)), CVWA (DerefOf (Index (Local1, $design)), Local5, Local4)), Index (Local0, $design))
+    Store (Add (DerefOf (Index (Local0, $full)), CVWA (DerefOf (Index (Local1, $full)), Local5, Local4)), Index (Local0, $full))
+    Store (Add (DerefOf (Index (Local0, $warning)), CVWA (DerefOf (Index (Local1, $warning)), Local5, Local4)), Index (Local0, $warning))
+    Store (Add (DerefOf (Index (Local0, $low)), CVWA (DerefOf (Index (Local1, $low)), Local5, Local4)), Index (Local0, $low))
+    Divide (Add (Multiply (DerefOf (Index (Local0, $voltage)), Local6), Local5), Add (Local6, One), Local7, Index (Local0, $voltage))
+}
+Increment (Local6)'''),
+      );
+      statusBlocks.add(
+        activeBlock(path, '''Store ($path._BST (), Local1)
+Store ($path.$infoMethod (), Local2)
+Store (DerefOf (Index (Local2, $power)), Local4)
+Store (DerefOf (Index (Local2, $voltage)), Local5)
+If (LEqual (Local6, Zero))
+{
+    Store (Local1, Local0)
+    Store (CVWA (DerefOf (Index (Local1, One)), Local5, Local4), Index (Local0, One))
+    Store (CVWA (DerefOf (Index (Local1, 0x02)), Local5, Local4), Index (Local0, 0x02))
+}
+Else
+{
+    Store (Or (DerefOf (Index (Local0, Zero)), DerefOf (Index (Local1, Zero))), Index (Local0, Zero))
+    Store (Add (DerefOf (Index (Local0, One)), CVWA (DerefOf (Index (Local1, One)), Local5, Local4)), Index (Local0, One))
+    Store (Add (DerefOf (Index (Local0, 0x02)), CVWA (DerefOf (Index (Local1, 0x02)), Local5, Local4)), Index (Local0, 0x02))
+    Divide (Add (Multiply (DerefOf (Index (Local0, 0x03)), Local6), DerefOf (Index (Local1, 0x03))), Add (Local6, One), Local7, Index (Local0, 0x03))
+}
+Increment (Local6)'''),
+      );
+    }
+
+    return '''Device (BATC)
+{
+    Name (_HID, EisaId ("PNP0C0A"))
+    Name (_UID, 0x02)
+    Name (_PCL, Package (One) { \\_SB })
+
+    Method (_INI, 0, NotSerialized)
+    {
+        If (_OSI ("Darwin"))
+        {
+${_indentBlock(hideLines.join('\n'), 12)}
+        }
+    }
+
+    Method (_STA, 0, NotSerialized)
+    {
+        If (LNot (_OSI ("Darwin"))) { Return (Zero) }
+        Local0 = Zero
+${_indentBlock(staLines.join('\n'), 8)}
+        Return (Local0)
+    }
+
+    Method (CVWA, 3, NotSerialized)
+    {
+        If (Arg2) { Return (Arg0) }
+        If (LEqual (Arg1, Zero)) { Return (Arg0) }
+        Divide (Multiply (Arg0, 0x03E8), Arg1, Local0, Local1)
+        Return (Local1)
+    }
+
+    Method ($infoMethod, 0, Serialized)
+    {
+        Local0 = Package ($fallbackPackageSize) {}
+        Local6 = Zero
+${_indentBlock(infoBlocks.join('\n'), 8)}
+        Return (Local0)
+    }
+
+    Method (_BST, 0, Serialized)
+    {
+        Local0 = Package (0x04) { Zero, Zero, Zero, Zero }
+        Local6 = Zero
+${_indentBlock(statusBlocks.join('\n'), 8)}
+        Return (Local0)
+    }
+}''';
+  }
+
+  /// 构建多电池SSDT
+  String _buildMultiBatterySsdt({
+    required List<Map<String, dynamic>> batteryDevices,
+    required List<Map<String, dynamic>> ecDevices,
+    required Map<String, Map<String, dynamic>> relatedMethods,
+    required Map<String, String> renameMap,
+    required Map<String, Map<String, dynamic>> renameTargetsMap,
+    required Map<String, String> methodBlocks,
+    required List<Map<String, dynamic>> usedFields,
+    required String externalLines,
+    required String ssdtName,
+  }) {
+    final ecScope = ecDevices.first["path"] as String? ?? "";
+    final batScope = batteryDevices.first["scope"] as String? ?? "";
+    final batteryNames = batteryDevices
+        .map((e) => e["name"] as String)
+        .toList();
+    final staOr = StringBuffer();
+    final iniHide = StringBuffer();
+
+    for (int i = 0; i < batteryNames.length; i++) {
+      final b = batteryNames[i];
+      staOr.writeln("                    Or (Local0, ^^$b._STA (), Local0)");
+      iniHide.writeln("""
+	                    If (CondRefOf (^^$b._HID))
+	                    {
+	                        Store (Zero, ^^$b._HID)
+	                    }""");
+    }
+
+    // 合并相同 Scope，避免生成重复作用域
+    final scopeParts = <String, List<String>>{};
+    void addPart(String scope, String block, {bool atStart = false}) {
+      final s = scope.trim();
+      if (s.isEmpty) return;
+      final b = block.trimRight();
+      if (b.trim().isEmpty) return;
+      final list = scopeParts.putIfAbsent(s, () => <String>[]);
+      if (atStart) {
+        list.insert(0, b);
+      } else {
+        list.add(b);
+      }
+    }
+
+    bool needsRead = false;
+    bool needsWrite = false;
+    bool needsB2IN = false;
+    final readReg = RegExp(r'\b(?:RECB|RMCB)\s*\(', caseSensitive: false);
+    final writeReg = RegExp(r'\b(?:WECB|WMCB)\s*\(', caseSensitive: false);
+    final b2inReg = RegExp(r'\bB2IN\s*\(', caseSensitive: false);
+
+    final orderedMethods = renameMap.keys.toList()
+      ..sort((left, right) {
+        final a = relatedMethods[left];
+        final b = relatedMethods[right];
+        final lineOrder = (a?["line"] as int? ?? 0).compareTo(
+          b?["line"] as int? ?? 0,
+        );
+        return lineOrder != 0 ? lineOrder : left.compareTo(right);
+      });
+
+    for (final method in orderedMethods) {
+      final renamed = renameMap[method]!;
+      final origins = _relatedMethodOrigins(relatedMethods[method]!);
+      origins.sort((left, right) {
+        final scopeOrder = (left["scope"] ?? '').toString().compareTo(
+          (right["scope"] ?? '').toString(),
+        );
+        if (scopeOrder != 0) return scopeOrder;
+        return (left["line"] as int? ?? 0).compareTo(
+          right["line"] as int? ?? 0,
+        );
+      });
+
+      for (final original in origins) {
+        var devicePath = (original["path"] ?? ecScope).toString();
+        if (method.toUpperCase().startsWith('_Q')) {
+          for (final battery in batteryDevices) {
+            final batteryPath = (battery["path"] ?? "").toString();
+            if (BatteryExternalNormalizer.pathKey(devicePath) ==
+                BatteryExternalNormalizer.pathKey(batteryPath)) {
+              devicePath = (battery["scope"] ?? ecScope).toString();
+              break;
+            }
+          }
+        }
+
+        final wrapper = _buildBatteryMethodWrapper(
+          relatedMethod: original,
+          renameTarget: renamed,
+          renameTargetsMap: renameTargetsMap,
+          usedFields: usedFields,
+          bodyTransformer: (body) =>
+              BatteryMultiTransformer.rewriteBatteryReferences(
+                body: body,
+                parentPath: ecScope,
+                batteryNames: batteryNames,
+              ),
+          elseCallTarget: renamed,
+          elseDirectCall: true,
+          wrapperScope: devicePath,
+        );
+
+        if (!needsRead && readReg.hasMatch(wrapper)) needsRead = true;
+        if (!needsWrite && writeReg.hasMatch(wrapper)) needsWrite = true;
+        if (!needsB2IN && b2inReg.hasMatch(wrapper)) needsB2IN = true;
+        addPart(devicePath, wrapper);
+      }
+    }
+
+    // EC helper methods: 仅在需要读/写宽字节时生成，且按实际引用的 EC scope 放置
+    final helperSpaces = <String, Set<String>>{};
+    for (final f in usedFields) {
+      final scope = (f["scope"] ?? "").toString().trim();
+      if (scope.isEmpty) continue;
+      final rawSpace = (f["regionSpace"] ?? "").toString();
+      final space = rawSpace.toLowerCase() == "systemmemory"
+          ? "SystemMemory"
+          : "EmbeddedControl";
+      helperSpaces.putIfAbsent(scope, () => <String>{}).add(space);
+    }
+    if (helperSpaces.isEmpty) {
+      for (final ec in ecDevices) {
+        final scope = (ec["path"] ?? "").toString().trim();
+        if (scope.isNotEmpty) {
+          helperSpaces[scope] = {"EmbeddedControl"};
+        }
+      }
+    }
+    for (final entry in helperSpaces.entries) {
+      final spaces = entry.value.toList()..sort();
+      for (final space in spaces) {
+        if (needsWrite) {
+          addPart(
+            entry.key,
+            _writeBatteryBufferMethod(writeWideField: true, regionSpace: space),
+            atStart: true,
+          );
+        }
+        if (needsRead) {
+          addPart(
+            entry.key,
+            _readBatteryBufferMethod(hasWideField: true, regionSpace: space),
+            atStart: true,
+          );
+        }
+      }
+    }
+
+    // BATC device block (placed into batScope)
+    final dartTwoBatteryBlock =
+        """
+	        Device (BATC)
+	        {
+	            Name (_HID, EisaId ("PNP0C0A"))
+	            Name (_UID, 0x02)
+	            Method (_INI, 0, NotSerialized)
+	            {
+	                If (_OSI ("Darwin"))
+	                {
+	                 ${_indentBlock(iniHide.toString().trimRight(), 20)}
+	                }
+	            }
+
+	            Method (_STA, 0, NotSerialized)
+	            {
+	                If (_OSI ("Darwin"))
+	                {
+	                    Store (Zero, Local0)
+	                    ${_indentBlock(staOr.toString().trimRight(), 20)}
+	                    Return (Local0)
+	                }
+	                Return (Zero)
+	            }
+
+	            Name (B0CO, Zero)
+	            Name (B1CO, Zero)
+	            Name (B0DV, Zero)
+	            Name (B1DV, Zero)
+
+	            Method (_BIF, 0, NotSerialized)
+	            {
+	                // Local0 BAT0._BIF
+	                // Local1 BAT1._BIF
+	                // Local2 BAT0._STA
+	                // Local3 BAT1._STA
+	                // Local4/Local5 scratch
+
+	                // gather and validate data from BAT0
+	                Local0 = ^^BAT0._BIF ()
+	                Local2 = ^^BAT0._STA ()
+	                If (0x1f == Local2)
+	                {
+	                    // check for invalid design capacity
+	                    Local4 = DerefOf (Local0 [1])
+	                    If (!Local4 || Ones == Local4) { Local2 = 0; }
+	                    // check for invalid last full charge capacity
+	                    Local4 = DerefOf (Local0 [2])
+	                    If (!Local4 || Ones == Local4) { Local2 = 0; }
+	                    // check for invalid design voltage
+	                    Local4 = DerefOf (Local0 [4])
+	                    If (!Local4 || Ones == Local4) { Local2 = 0; }
+	                }
+	                // gather and validate data from BAT1
+	                Local1 = ^^BAT1._BIF ()
+	                Local3 = ^^BAT1._STA ()
+	                If (0x1f == Local3)
+	                {
+	                    // check for invalid design capacity
+	                    Local4 = DerefOf (Local1 [1])
+	                    If (!Local4 || Ones == Local4) { Local3 = 0; }
+	                    // check for invalid last full charge capacity
+	                    Local4 = DerefOf (Local1 [2])
+	                    If (!Local4 || Ones == Local4) { Local3 = 0; }
+	                    // check for invalid design voltage
+	                    Local4 = DerefOf (Local1 [4])
+	                    If (!Local4 || Ones == Local4) { Local3 = 0; }
+	                }
+	                // find primary and secondary battery
+	                If (0x1f != Local2 && 0x1f == Local3)
+	                {
+	                    // make primary use BAT1 data
+	                    Local0 = Local1 // BAT1._BIF result
+	                    Local2 = Local3 // BAT1._STA result
+	                    Local3 = 0  // no secondary battery
+	                }
+	                // combine batteries into Local0 result if possible
+	                If (0x1f == Local2 && 0x1f == Local3)
+	                {
+	                    // _BIF 0 Power Unit - leave BAT0 value
+	                    // _BIF 1 Design Capacity - add BAT0 and BAT1 values
+	                    Local4 = DerefOf (Local0 [1])
+	                    Local5 = DerefOf (Local1 [1])
+	                    If (0xffffffff != Local4 && 0xffffffff != Local5)
+	                    {
+	                        Local0 [1] = Local4 + Local5
+	                    }
+	                    // _BIF 2 Last Full Charge Capacity - add BAT0 and BAT1 values
+	                    Local4 = DerefOf (Local0 [2])
+	                    Local5 = DerefOf (Local1 [2])
+	                    If (0xffffffff != Local4 && 0xffffffff != Local5)
+	                    {
+	                        Local0 [2] = Local4 + Local5
+	                    }
+	                    // _BIF 3 Battery Technology - leave BAT0 value
+	                    // _BIF 4 Design Voltage - average between BAT0 and BAT1 values
+	                    Local4 = DerefOf (Local0 [4])
+	                    Local5 = DerefOf (Local1 [4])
+	                    If (0xffffffff != Local4 && 0xffffffff != Local5)
+	                    {
+	                        Local0 [4] = (Local4 + Local5) / 2
+	                    }
+	                    // _BIF 5 Design Capacity of Warning - add BAT0 and BAT1 values
+	                    Local0 [5] = DerefOf (Local0 [5]) + DerefOf (Local1 [5])
+	                    // _BIF 6 Design Capacity of Low - add BAT0 and BAT1 values
+	                    Local0 [6] = DerefOf (Local0 [6]) + DerefOf (Local1 [6])
+	                    // _BIF 7 Battery Capacity Granularity 1 - add BAT0 and BAT1 values
+	                    Local4 = DerefOf (Local0 [7])
+	                    Local5 = DerefOf (Local1 [7])
+	                    If (0xffffffff != Local4 && 0xffffffff != Local5)
+	                    {
+	                        Local0 [7] = Local4 + Local5
+	                    }
+	                    // _BIF 8 Battery Capacity Granularity 2 - add BAT0 and BAT1 values
+	                    Local4 = DerefOf (Local0 [8])
+	                    Local5 = DerefOf (Local1 [8])
+	                    If (0xffffffff != Local4 && 0xffffffff != Local5)
+	                    {
+	                        Local0 [8] = Local4 + Local5
+	                    }
+	                    // _BIF 9 Model Number - concatenate BAT0 and BAT1 values
+	                    Local0 [0x09] = Concatenate (Concatenate (DerefOf (Local0 [0x09]), " / "), DerefOf (Local1 [0x09]))
+	                    // _BIF a Serial Number - concatenate BAT0 and BAT1 values
+	                    Local0 [0x0a] = Concatenate (Concatenate (DerefOf (Local0 [0x0a]), " / "), DerefOf (Local1 [0x0a]))
+	                    // _BIF b Battery Type - concatenate BAT0 and BAT1 values
+	                    Local0 [0x0b] = Concatenate (Concatenate (DerefOf (Local0 [0x0b]), " / "), DerefOf (Local1 [0x0b]))
+	                    // _BIF c OEM Information - concatenate BAT0 and BAT1 values
+	                    Local0 [0x0c] = Concatenate (Concatenate (DerefOf (Local0 [0x0c]), " / "), DerefOf (Local1 [0x0c]))
+	                }
+
+	                Return (Local0)
+	            }
+
+	            Method (_BST, 0, NotSerialized)
+	            {
+	               // Local0 BAT0._BST
+	                // Local1 BAT1._BST
+	                // Local2 BAT0._STA
+	                // Local3 BAT1._STA
+	                // Local4/Local5 scratch
+
+	                // gather battery data from BAT0
+	                Local0 = ^^BAT0._BST ()
+	                Local2 = ^^BAT0._STA ()
+	                If (0x1f == Local2)
+	                {
+	                    // check for invalid remaining capacity
+	                    Local4 = DerefOf (Local0 [2])
+	                    If (!Local4 || Ones == Local4) { Local2 = 0; }
+	                }
+	                // gather battery data from BAT1
+	                Local1 = ^^BAT1._BST ()
+	                Local3 = ^^BAT1._STA ()
+	                If (0x1f == Local3)
+	                {
+	                    // check for invalid remaining capacity
+	                    Local4 = DerefOf (Local1 [2])
+	                    If (!Local4 || Ones == Local4) { Local3 = 0; }
+	                }
+	                // find primary and secondary battery
+	                If (0x1f != Local2 && 0x1f == Local3)
+	                {
+	                    // make primary use BAT1 data
+	                    Local0 = Local1 // BAT1._BST result
+	                    Local2 = Local3 // BAT1._STA result
+	                    Local3 = 0  // no secondary battery
+	                }
+	                // combine batteries into Local0 result if possible
+	                If (0x1f == Local2 && 0x1f == Local3)
+	                {
+	                    // _BST 0 - Battery State - if one battery is charging, then charging, else discharging
+	                    Local4 = DerefOf (Local0 [0])
+	                    Local5 = DerefOf (Local1 [0])
+	                    If (Local4 != Local5)
+	                    {
+	                        If (Local4 == 2 || Local5 == 2)
+	                        {
+	                            // 2 = charging
+	                            Local0 [0] = 2
+	                        }
+	                        ElseIf (Local4 == 1 || Local5 == 1)
+	                        {
+	                            // 1 = discharging
+	                            Local0 [0] = 1
+	                        }
+	                        ElseIf (Local4 == 3 || Local5 == 3)
+	                        {
+	                            Local0 [0] = 3
+	                        }
+	                        ElseIf (Local4 == 4 || Local5 == 4)
+	                        {
+	                            // critical
+	                            Local0 [0] = 4
+	                        }
+	                        ElseIf (Local4 == 5 || Local5 == 5)
+	                        {
+	                            // critical and discharging
+	                            Local0 [0] = 5
+	                        }
+	                        // if none of the above, just leave as BAT0 is
+	                    }
+
+	                    // _BST 1 - Battery Present Rate - add BAT0 and BAT1 values
+	                    Local0 [1] = DerefOf (Local0 [1]) + DerefOf (Local1 [1])
+	                    // _BST 2 - Battery Remaining Capacity - add BAT0 and BAT1 values
+	                    Local0 [2] = DerefOf (Local0 [2]) + DerefOf (Local1 [2])
+	                    // _BST 3 - Battery Present Voltage - average between BAT0 and BAT1 values
+	                    Local0 [3] = (DerefOf (Local0 [3]) + DerefOf (Local1 [3])) / 2
+	                }
+	                Return (Local0)
+	            }
+	        }
+	      """;
+    bool batteryHasMethod(Map<String, dynamic> battery, String name) {
+      final methods = battery['methods'] as List<dynamic>? ?? const [];
+      return methods.any(
+        (method) => (method['name'] ?? '').toString().toUpperCase() == name,
+      );
+    }
+
+    final allBif = batteryDevices.every(
+      (battery) => batteryHasMethod(battery, '_BIF'),
+    );
+    final multiBatteryBlock = batteryDevices.length == 2 && allBif
+        ? dartTwoBatteryBlock
+              .replaceAll('BAT0', batteryNames[0])
+              .replaceAll('BAT1', batteryNames[1])
+        : _buildGenericMultiBatteryDevice(
+            batteryDevices,
+            allBif ? '_BIF' : '_BIX',
+          );
+    addPart(batScope, multiBatteryBlock, atStart: true);
+
+    String buildScopeBlock(String scope, List<String> parts) {
+      final merged = parts
+          .map((p) => _dedentBlock(p).trimRight())
+          .where((p) => p.trim().isNotEmpty)
+          .toList();
+      if (merged.isEmpty) return "";
+      return """
+	    Scope ($scope)
+	    {
+${_indentBlock(merged.join("\n\n"), 8)}
+	    }""";
+    }
+
+    final orderedScopes = scopeParts.keys.toList()..sort();
+    if (batScope.trim().isNotEmpty && orderedScopes.remove(batScope)) {
+      orderedScopes.insert(0, batScope);
+    }
+    final scopeBlocks = orderedScopes
+        .map((s) => buildScopeBlock(s, scopeParts[s]!))
+        .where((s) => s.trim().isNotEmpty)
+        .join("\n\n");
+
+    final rootBlocks = <String>[];
+    if (externalLines.trim().isNotEmpty) {
+      rootBlocks.add(externalLines.trimRight());
+    }
+    if (needsB2IN) {
+      rootBlocks.add(
+        _indentBlock(
+          _dedentBlock(_bufferToIntegerMethod(hasWideField: true)).trimRight(),
+          4,
+        ),
+      );
+    }
+    if (scopeBlocks.trim().isNotEmpty) {
+      rootBlocks.add(scopeBlocks.trimRight());
+    }
+
+    return """
+	DefinitionBlock ("", "SSDT", 2, "RAPID", "BATC", 0x00000000)
+	{
+${rootBlocks.join("\n\n")}
+	}
+	""";
+  }
+
+  /// 构建单电池SSDT
+  String _buildSingleBatterySsdt({
+    required List<Map<String, dynamic>> ecDevices,
+    required Map<String, Map<String, dynamic>> relatedMethods,
+    required String externalLines,
+    required Map<String, String> wrappers,
+    required List<Map<String, dynamic>> usedFields,
+  }) {
+    final wrapperText = wrappers.values.join("\n\n");
+    final needsRead = RegExp(
+      r'\b(?:RECB|RMCB)\s*\(',
+      caseSensitive: false,
+    ).hasMatch(wrapperText);
+    final needsWrite = RegExp(
+      r'\b(?:WECB|WMCB)\s*\(',
+      caseSensitive: false,
+    ).hasMatch(wrapperText);
+    final needsB2IN = RegExp(
+      r'\bB2IN\s*\(',
+      caseSensitive: false,
+    ).hasMatch(wrapperText);
+
+    // 合并相同 Scope，避免生成重复作用域
+    final scopeParts = <String, List<String>>{};
+    void addPart(String scope, String block) {
+      final s = scope.trim();
+      if (s.isEmpty) return;
+      final b = block.trimRight();
+      if (b.trim().isEmpty) return;
+      scopeParts.putIfAbsent(s, () => []).add(b);
+    }
+
+    // EC helper methods: 仅在需要读/写宽字节时生成，且按实际引用的 EC scope 放置
+    final helperSpaces = <String, Set<String>>{};
+    for (final f in usedFields) {
+      final scope = (f["scope"] ?? "").toString().trim();
+      if (scope.isEmpty) continue;
+      final rawSpace = (f["regionSpace"] ?? "").toString();
+      final space = rawSpace.toLowerCase() == "systemmemory"
+          ? "SystemMemory"
+          : "EmbeddedControl";
+      helperSpaces.putIfAbsent(scope, () => <String>{}).add(space);
+    }
+    if (helperSpaces.isEmpty) {
+      for (final ec in ecDevices) {
+        final scope = (ec["path"] ?? "").toString().trim();
+        if (scope.isNotEmpty) {
+          helperSpaces[scope] = {"EmbeddedControl"};
+        }
+      }
+    }
+    for (final entry in helperSpaces.entries) {
+      final spaces = entry.value.toList()..sort();
+      for (final space in spaces) {
+        if (needsRead) {
+          addPart(
+            entry.key,
+            _readBatteryBufferMethod(hasWideField: true, regionSpace: space),
+          );
+        }
+        if (needsWrite) {
+          addPart(
+            entry.key,
+            _writeBatteryBufferMethod(writeWideField: true, regionSpace: space),
+          );
+        }
+      }
+    }
+
+    // 方法包装器按原 Scope 和源表顺序输出
+    final orderedMethods = relatedMethods.keys.toList()
+      ..sort((left, right) {
+        final a = relatedMethods[left]!;
+        final b = relatedMethods[right]!;
+        final scopeOrder = (a["scope"] ?? "").toString().compareTo(
+          (b["scope"] ?? "").toString(),
+        );
+        if (scopeOrder != 0) return scopeOrder;
+        final lineOrder = (a["line"] as int? ?? 0).compareTo(
+          b["line"] as int? ?? 0,
+        );
+        return lineOrder != 0 ? lineOrder : left.compareTo(right);
+      });
+    for (final methodName in orderedMethods) {
+      final scope = (relatedMethods[methodName]?["scope"] ?? "").toString();
+      final wrapper = wrappers[methodName] ?? "";
+      addPart(scope, wrapper);
+    }
+
+    String buildScopeBlock(String scope, List<String> parts) {
+      final merged = parts
+          .map((p) => _dedentBlock(p).trimRight())
+          .where((p) => p.trim().isNotEmpty)
+          .toList();
+      if (merged.isEmpty) return "";
+      return """
+    Scope ($scope)
+    {
+${_indentBlock(merged.join("\n\n"), 8)}
+    }""";
+    }
+
+    final orderedScopes = scopeParts.keys.toList()..sort();
+    final scopeBlocks = orderedScopes
+        .map((s) => buildScopeBlock(s, scopeParts[s]!))
+        .where((s) => s.trim().isNotEmpty)
+        .join("\n\n");
+
+    final rootBlocks = <String>[];
+    if (externalLines.trim().isNotEmpty) {
+      rootBlocks.add(externalLines.trimRight());
+    }
+    if (needsB2IN) {
+      rootBlocks.add(
+        _indentBlock(
+          _dedentBlock(_bufferToIntegerMethod(hasWideField: true)).trimRight(),
+          4,
+        ),
+      );
+    }
+    if (scopeBlocks.trim().isNotEmpty) {
+      rootBlocks.add(scopeBlocks.trimRight());
+    }
+
+    return """
+DefinitionBlock ("", "SSDT", 2, "RAPID", "BAT", 0x00000000)
+{
+${rootBlocks.join("\n\n")}
+}
+""";
+  }
+
+  /// 将字符串转换为十六进制表示
+  String _nameToHex(String name) => name.codeUnits
+      .map((c) => c.toRadixString(16).padLeft(2, '0').toUpperCase())
+      .join();
+
+  /// 重命名方法名，默认使用 `X` 前缀；若出现同名冲突，则自动尝试 `Y/Z/W...` 以避免重复。
+  ///
+  /// - 只生成 4 字符 NameSeg
+  /// - `usedNames` 用于避免同一轮生成过程中出现重名
+  String _renamedMethodName(String methodName, {Set<String>? usedNames}) {
+    final raw = methodName.trim().toUpperCase();
+    final n = raw.length >= 4 ? raw.substring(0, 4) : raw.padRight(4, '_');
+    final suffix = n.substring(1); // 3 chars
+
+    const leads = <String>[
+      'X',
+      'Y',
+      'Z',
+      'W',
+      'V',
+      'U',
+      'T',
+      'S',
+      'R',
+      'Q',
+      'P',
+      'O',
+      'N',
+      'M',
+      'L',
+      'K',
+      'J',
+      'I',
+      'H',
+      'G',
+      'F',
+      'E',
+      'D',
+      'C',
+      'B',
+      'A',
+    ];
+
+    if (usedNames == null) {
+      return "X$suffix";
+    }
+
+    for (final lead in leads) {
+      final candidate = "$lead$suffix";
+      // 避免 no-op rename（例如原本就是 X???）
+      if (candidate == n) continue;
+      if (!usedNames.contains(candidate)) return candidate;
+    }
+
+    // 理论上不会走到这里（除非同 suffix 的重命名数量过多）。
+    return "X$suffix";
+  }
+
+  /// 缩进代码块，每个行前添加指定数量的空格
+  String _indentBlock(String input, int spaces) {
+    final pad = " " * spaces;
+    return input.split("\n").map((line) => "$pad$line").join("\n");
+  }
+
+  /// 移除代码块的首尾空行和公共缩进
+  String _dedentBlock(String input) {
+    var lines = input.replaceAll("\r\n", "\n").split("\n");
+    while (lines.isNotEmpty && lines.first.trim().isEmpty) {
+      lines = lines.sublist(1);
+    }
+    while (lines.isNotEmpty && lines.last.trim().isEmpty) {
+      lines = lines.sublist(0, lines.length - 1);
+    }
+    if (lines.isEmpty) return "";
+
+    var minIndent = 1 << 30;
+    for (final line in lines) {
+      if (line.trim().isEmpty) continue;
+      final indent = line.length - line.trimLeft().length;
+      if (indent < minIndent) minIndent = indent;
+    }
+    if (minIndent == (1 << 30)) minIndent = 0;
+
+    final out = <String>[];
+    for (final line in lines) {
+      if (line.trim().isEmpty) {
+        out.add("");
+        continue;
+      }
+      out.add(
+        line.length >= minIndent ? line.substring(minIndent) : line.trimLeft(),
+      );
+    }
+    return out.join("\n");
+  }
+
+  /// 构建电池方法包装器
+  String _buildBatteryMethodWrapper({
+    required Map<String, dynamic> relatedMethod,
+    required String renameTarget,
+    required Map<String, Map<String, dynamic>> renameTargetsMap,
+    required List<Map<String, dynamic>> usedFields,
+    String Function(String body)? bodyTransformer,
+    String? elseCallTarget,
+    bool elseDirectCall = false,
+    String? wrapperScope,
+  }) {
+    final methodName = relatedMethod["name"] as String? ?? "";
+    final originalBlock = relatedMethod["text"] as String? ?? "";
+    final argCount = relatedMethod["argCount"];
+    final methodFlag = relatedMethod["flags"];
+
+    // 关键修复1：保留原始缩进，不盲目trim()
+    final bodyStart = originalBlock.indexOf("{");
+    final bodyEnd = originalBlock.lastIndexOf("}");
+    String body = "";
+    if (bodyStart >= 0 && bodyEnd > bodyStart) {
+      // 截取时保留所有字符（包括空格/缩进），只去掉首尾的{和}
+      body = originalBlock.substring(bodyStart + 1, bodyEnd);
+      // 仅去掉首尾空白，保留中间缩进
+      body = body.trimLeft().trimRight();
+    } else {
+      body =
+          "Return (${_buildMethodCall(renameTarget, renameTargetsMap[renameTarget]!)})";
+    }
+
+    final transformed = BatteryBodyTransformer.transform(
+      body: body,
+      methodName: methodName,
+      semantics: BatteryMethodSemantics(
+        bif: relatedMethod["batteryBif"] == true,
+        bix: relatedMethod["batteryBix"] == true,
+        bst: relatedMethod["batteryBst"] == true,
+      ),
+      fields: usedFields,
+    );
+    if (!transformed.valid) {
+      throw StateError('$methodName 电池字段转换失败：${transformed.error}');
+    }
+    body = transformed.body;
+    for (final message in transformed.logs) {
+      Log(message);
+    }
+
+    // 在字段替换完成后，再执行bodyTransformer
+    if (bodyTransformer != null) {
+      body = bodyTransformer(body);
+    }
+
+    final methodScope = (relatedMethod["scope"] ?? "").toString();
+    final methodPath = methodScope.isEmpty
+        ? methodName
+        : "$methodScope.$methodName";
+    final namespaceResolution = BatteryNamespaceResolver.resolveBody(
+      body: body,
+      methodPath: methodPath,
+      objects: _batteryNamespaceObjects,
+      generatedObjects: {
+        "B2IN",
+        BatteryExternalNormalizer.pathKey("$methodScope.RECB"),
+        BatteryExternalNormalizer.pathKey("$methodScope.RE1B"),
+        BatteryExternalNormalizer.pathKey("$methodScope.WECB"),
+        BatteryExternalNormalizer.pathKey("$methodScope.WE1B"),
+        BatteryExternalNormalizer.pathKey("$methodScope.RMCB"),
+        BatteryExternalNormalizer.pathKey("$methodScope.RM1B"),
+        BatteryExternalNormalizer.pathKey("$methodScope.WMCB"),
+        BatteryExternalNormalizer.pathKey("$methodScope.WM1B"),
+        BatteryExternalNormalizer.pathKey("$methodScope.BATC"),
+      },
+    );
+    body = namespaceResolution.body;
+    _batteryBodyExternals.addAll(namespaceResolution.externals);
+
+    final elseTarget = elseCallTarget ?? renameTarget;
+    final elseMethod = elseTarget == renameTarget
+        ? relatedMethod
+        : renameTargetsMap[elseTarget]!;
+    final elseCallExpr = _buildMethodCall(
+      renameTarget,
+      elseMethod,
+      fromScope: wrapperScope ?? methodScope,
+    );
+
+    // 检查原始方法是否有返回值
+    final hasReturn = originalBlock.contains(
+      RegExp(r'\bReturn\b', caseSensitive: false),
+    );
+
+    // 构建Else分支
+    String elseBranch;
+    if (hasReturn) {
+      elseBranch = "                Return ($elseCallExpr)";
+    } else {
+      elseBranch = "               $elseCallExpr";
+    }
+
+    return """Method ($methodName, $argCount, $methodFlag)
+{
+    If (_OSI ("Darwin"))
+    {
+${_indentBlock(body, 8)}
+    }
+    Else
+    {
+$elseBranch
+    }
+}""";
+  }
+
+  /// 构建方法调用表达式
+  String _buildMethodCall(
+    String renameTarget,
+    Map<String, dynamic> method, {
+    String? fromScope,
+  }) {
+    final argCount = method["argCount"] as int? ?? 0;
+    final args = List.generate(argCount, (i) => "Arg$i").join(", ");
+    final scope = method["scope"] as String? ?? "";
+    if (fromScope != null &&
+        BatteryExternalNormalizer.pathKey(fromScope) ==
+            BatteryExternalNormalizer.pathKey(scope)) {
+      return "$renameTarget ($args)";
+    }
+    return "$scope.$renameTarget ($args)";
+  }
+
+  /// 检查方法体中是否使用了超过8字节的EC字段。
+  /// 如果方法体中使用了超过8字节的字段，则返回true；否则返回false。
+  (bool, Set<String>) _methodAccessesWideFields({
+    required String? methodText,
+    required List<Map<String, dynamic>> fieldList,
+  }) {
+    if (methodText == null || methodText.isEmpty) return (false, {});
+
+    // 提取方法体中使用的所有变量名
+    final variables = _extractUsedVariables(methodText);
+    final wideFields = <String>{};
+    // 检查是否有变量超过8字节
+    for (final variable in variables) {
+      final fieldInfo = fieldList.firstWhere(
+        (field) =>
+            (field["name"] ?? "").toString().toUpperCase() ==
+            variable.toUpperCase(),
+        orElse: () => const {},
+      );
+
+      if (fieldInfo.isNotEmpty) {
+        final bitLength = fieldInfo["bitLength"] as int? ?? 0;
+        if (bitLength > 8) {
+          wideFields.add(variable);
+        }
+      }
+    }
+
+    return (wideFields.isNotEmpty, wideFields);
+  }
+
+  /// 提取方法体中使用的所有变量名
+  Set<String> _extractUsedVariables(String methodBody) {
+    final variables = <String>{};
+
+    // 匹配变量名，排除方法名和关键字
+    final regex = RegExp(r'\b([A-Za-z_][A-Za-z0-9_]*)\b');
+    final matches = regex.allMatches(methodBody);
+
+    const ignoreKeywords = {
+      "METHOD",
+      "IF",
+      "ELSE",
+      "ELSEIF",
+      "RETURN",
+      "STORE",
+      "AND",
+      "OR",
+      "NOT",
+      "LAND",
+      "LOR",
+      "LNOT",
+      "LEQUAL",
+      "LNOTEQUAL",
+      "LGREATER",
+      "LGREATEREQUAL",
+      "LLESS",
+      "LLESSEQUAL",
+      "ADD",
+      "SUBTRACT",
+      "MULTIPLY",
+      "DIVIDE",
+      "MOD",
+      "SHL",
+      "SHR",
+      "SAR",
+      "XOR",
+      "CONCAT",
+      "MATCH",
+      "FINDSET",
+      "FINDSETREVERSE",
+      "DEREF",
+      "INDEX",
+      "LENGTH",
+      "SIZE",
+      "TOSTRING",
+      "TOINTEGER",
+      "TOBUFFER",
+      "TOUUID",
+      "COPBUFF",
+      "ALLOCATE",
+      "FREE",
+      "ACQUIRE",
+      "RELEASE",
+      "SLEEP",
+      "STALL",
+      "NOTIFY",
+      "SIGNAL",
+      "SYNCOPT",
+      "DEBUG",
+      "ASSERT",
+      "RESET",
+      "PWRSRC",
+      "ACPI_METHOD",
+      "ARG0",
+      "ARG1",
+      "ARG2",
+      "ARG3",
+      "ARG4",
+      "ARG5",
+      "ARG6",
+      "ARG7",
+      "LOCAL0",
+      "LOCAL1",
+      "LOCAL2",
+      "LOCAL3",
+      "LOCAL4",
+      "LOCAL5",
+      "LOCAL6",
+      "LOCAL7",
+      "TRUE",
+      "FALSE",
+      "ZERO",
+      "ONE",
+      "ONES",
+      "ON",
+    };
+
+    for (final match in matches) {
+      final variable = match.group(1)?.toUpperCase() ?? "";
+      if (variable.isNotEmpty && !ignoreKeywords.contains(variable)) {
+        variables.add(variable);
+      }
+    }
+
+    return variables;
+  }
+
+  /// 提取方法体中调用的所有方法引用
+  Set<String> _extractInvokedMethodReferences(String methodBlock) {
+    const ignore = <String>{
+      "METHOD",
+      "IF",
+      "ELSE",
+      "ELSEIF",
+      "RETURN",
+      "STORE",
+      "AND",
+      "OR",
+      "XOR",
+      "DECREMENT",
+      "NOT",
+      "LAND",
+      "LOR",
+      "CASE",
+      "SWITCH",
+      "TOINTEGER",
+      "TOBCD",
+      "INCREMENT",
+      "REFOF",
+      "CREATEBYTEFIELD",
+      "LNOT",
+      "LEQUAL",
+      "LNOTEQUAL",
+      "LGREATER",
+      "LGREATEREQUAL",
+      "LLESS",
+      "LLESSEQUAL",
+      "SHIFTLEFT",
+      "SHIFTRIGHT",
+      "MULTIPLY",
+      "DIVIDE",
+      "SUBTRACT",
+      "ADD",
+      "SLEEP",
+      "WHILE",
+      "ACQUIRE",
+      "RELEASE",
+      "CONDREFOF",
+      "DEREFOF",
+      "INDEX",
+      "PACKAGE",
+      "BUFFER",
+      "NAME",
+      "SIZEOF",
+      "NOTIFY",
+      "TOSTRING",
+      "TODECIMALSTRING",
+      "MID",
+      "CONCATENATE",
+      "COPYOBJECT",
+      "DEBUG",
+      "_OSI",
+    };
+
+    final out = <String>{};
+    final callReg = RegExp(
+      r'(?<![A-Za-z0-9_])((?:[\\^]+)?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(',
+      caseSensitive: false,
+    );
+    for (final m in callReg.allMatches(methodBlock)) {
+      final reference = (m.group(1) ?? "").toUpperCase();
+      final name = reference.split('.').last;
+      if (name.isEmpty || ignore.contains(name)) continue;
+      if (RegExp(r'^[0-9]+$').hasMatch(name)) continue;
+      if (name.length != 4) continue;
+      out.add(reference);
+    }
+    return out;
+  }
+
+  List<Map<String, String>> _extractUsedSymbols(List<String> methodTexts) {
+    final results = <String, Map<String, String>>{};
+
+    /// 匹配完整 ACPI NamePath
+    final pathPattern = RegExp(r'(\\[A-Za-z0-9_.]+|\^{1,}[A-Za-z0-9_.]+)');
+
+    /// 匹配普通 NameSeg
+    final nameSegPattern = RegExp(
+      r'(^|[^A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,3})(?=[^A-Za-z0-9_]|$)',
+    );
+
+    for (var methodText in methodTexts) {
+      // 去单行注释
+      methodText = methodText.replaceAll(RegExp(r'//.*'), '');
+
+      // 去多行注释
+      methodText = methodText.replaceAll(
+        RegExp(r'/\*.*?\*/', dotAll: true),
+        '',
+      );
+
+      // 去字符串
+      methodText = methodText.replaceAll(RegExp(r'"[^"]*"'), '');
+
+      // 移除 Method 头
+      methodText = methodText.replaceAll(
+        RegExp(r'^\s*Method\s*\([^\)]*\)', multiLine: true),
+        '',
+      );
+
+      /// ① 解析完整路径
+      for (final match in pathPattern.allMatches(methodText)) {
+        final raw = match.group(0)!;
+        final name = raw.split('.').last.toUpperCase();
+
+        if (_isKeyword(name)) continue;
+
+        final rest = methodText.substring(match.end).trimLeft();
+        final isMethodCall = rest.startsWith('(');
+
+        results[name] = {
+          "name": name,
+          "path": raw,
+          "type": isMethodCall ? "method" : "variable",
+        };
+      }
+
+      /// ② 解析普通 NameSeg
+      for (final match in nameSegPattern.allMatches(methodText)) {
+        final symbol = match.group(2)!;
+        final name = symbol.toUpperCase();
+
+        if (_isKeyword(name)) continue;
+
+        if (results.containsKey(name)) continue;
+
+        final rest = methodText.substring(match.end).trimLeft();
+        final isMethodCall = rest.startsWith('(');
+
+        results[name] = {
+          "name": name,
+          "path": name,
+          "type": isMethodCall ? "method" : "variable",
+        };
+      }
+    }
+
+    return results.values.toList();
+  }
+
+  /// 检查方法是否包含 Notify (BATx 通知
+  Set<String> _extractBatteryNotifyTargets(
+    String methodText,
+    Set<String> batteryNames,
+  ) {
+    final out = <String>{};
+    for (final batteryName in batteryNames) {
+      final reg = RegExp(
+        r'Notify\s*\(\s*(?:[\\^A-Z0-9_\.]+\.)?' +
+            RegExp.escape(batteryName) +
+            r'\s*,',
+        caseSensitive: false,
+      );
+      if (reg.hasMatch(methodText)) {
+        out.add(batteryName.toUpperCase());
+      }
+    }
+    return out;
+  }
+
+  /// 构建方法的完整路径，格式为 Scope.Name
+  String _methodFullPath(String scope, String name) =>
+      "${scope.trim()}.${name.trim().toUpperCase()}";
+
+  /// 按 ACPI NameString 规则解析方法引用
+  Map<String, dynamic>? _resolveMethodReference({
+    required String reference,
+    required String callerPath,
+    required Map<String, Map<String, dynamic>> byFullPath,
+    required Map<String, Map<String, dynamic>> byPathKey,
+    required Map<String, List<Map<String, dynamic>>> byName,
+  }) {
+    for (final candidate in BatteryNamespaceResolver.lookupCandidates(
+      reference,
+      callerPath,
+    )) {
+      final normalized = BatteryExternalNormalizer.normalizePath(candidate);
+      final hit = byFullPath[normalized];
+      if (hit != null) return hit;
+      final candidateKey = BatteryExternalNormalizer.pathKey(candidate);
+      final normalizedHit = byPathKey[candidateKey];
+      if (normalizedHit != null) return normalizedHit;
+    }
+
+    final upper = reference.split('.').last.toUpperCase();
+    // 无法按路径解析时，仅允许回退到全局唯一的同名方法。
+    final candidates = byName[upper];
+    if (candidates == null || candidates.isEmpty) return null;
+    if (candidates.length == 1) return candidates.first;
+    return null;
+  }
+
+  /// 收集所有已加载 ACPI 表中的方法，包括 EC/BAT 嵌套 Device 与独立 SSDT。
+  List<Map<String, dynamic>> _allBatteryNamespaceMethods() {
+    final methods = <Map<String, dynamic>>[];
+    for (final tableEntry in d.acpiTables.entries) {
+      final table = tableEntry.value;
+      if (table is! Map<String, dynamic>) continue;
+      final paths = table["paths"] as List<dynamic>? ?? const [];
+      for (final rawPath in paths) {
+        if (rawPath is! List || rawPath.length < 3) continue;
+        if (rawPath[2].toString().toUpperCase() != "METHOD") continue;
+        final fullPath = BatteryExternalNormalizer.normalizePath(
+          rawPath[0].toString(),
+        );
+        final separator = fullPath.lastIndexOf('.');
+        if (separator <= 0) continue;
+        final line = rawPath[1] is int
+            ? rawPath[1] as int
+            : int.tryParse(rawPath[1].toString()) ?? -1;
+        if (line < 0) continue;
+        final scopeLines = d.getScope(
+          startingIndex: line,
+          stripComments: true,
+          table: table,
+        );
+        if (scopeLines.isEmpty) continue;
+        final text = scopeLines.join("\n").trim();
+        final header = RegExp(
+          r'^\s*Method\s*\(\s*([^,]+)\s*,\s*(\d+)\s*,\s*([^,\)]+)',
+          caseSensitive: false,
+        ).firstMatch(text);
+        final name = fullPath.substring(separator + 1).toUpperCase();
+        methods.add({
+          "text": text,
+          "type": "MethodObj",
+          "name": name,
+          "argCount": int.tryParse(header?.group(2) ?? "0") ?? 0,
+          "flags": (header?.group(3) ?? "NotSerialized").trim(),
+          "line": line,
+          "scope": fullPath.substring(0, separator),
+          "path": fullPath.substring(0, separator),
+          "tableName": tableEntry.key,
+        });
+      }
+    }
+    return methods;
+  }
+
+  (
+    List<Map<String, dynamic>>,
+    Map<String, Map<String, dynamic>>,
+    Map<String, Map<String, dynamic>>,
+    Set<String>,
+  )
+  _buildBatteryDependencyTable({
+    required List<Map<String, dynamic>> batteryDevices,
+    required List<Map<String, dynamic>> ecDevices,
+    required Set<String> entryMethods,
+    required bool includeAllReachableMethods,
+  }) {
+    final batteryNames = batteryDevices
+        .map((e) => (e["name"] ?? "").toString().toUpperCase())
+        .where((e) => e.isNotEmpty)
+        .toSet();
+
+    // 收集所有EC字段，用于宽字节检测（bitLength > 8 或 byteLength > 1）
+    final allEcFields = <Map<String, dynamic>>[];
+    final ecFieldByName = <String, Map<String, dynamic>>{};
+    for (final ecDevice in ecDevices) {
+      final opRegions =
+          ecDevice["operationRegions"] as List<dynamic>? ?? const [];
+      final opRegionByName = <String, Map<String, dynamic>>{};
+      for (final op in opRegions) {
+        final name = (op["name"] ?? "").toString().toUpperCase();
+        if (name.isEmpty) continue;
+        opRegionByName.putIfAbsent(name, () => op);
+      }
+
+      final scopeFields = ecDevice["scopeFields"] as List<dynamic>? ?? const [];
+      for (final block in scopeFields) {
+        final regionName = (block["regionName"] ?? "").toString().trim();
+        final regionKey = regionName.toUpperCase();
+        final op = opRegionByName[regionKey];
+        final indexed = block["indexed"] == true;
+        if (indexed) {
+          final warning =
+              "${ecDevice["path"]} 包含间接 IndexField；字段位置已解析为控制器相对寄存器偏移。";
+          if (_batteryRegionWarnings.add(warning)) Log.warning(warning);
+        }
+        final rawRegionSpace = (op?["space"] ?? "").toString();
+        final supportedRegion =
+            rawRegionSpace.toLowerCase() == "embeddedcontrol" ||
+            rawRegionSpace.toLowerCase() == "systemmemory";
+        if (!indexed && (op == null || !supportedRegion)) continue;
+
+        final originOffset = indexed ? 0 : (op!["offset"] as int? ?? 0);
+        final regionSpace = indexed ? "EmbeddedControl" : rawRegionSpace;
+        final originExpression = indexed
+            ? null
+            : (op!["offsetExpression"] as String?);
+
+        final fieldList = block["fields"] as List<dynamic>? ?? const [];
+        for (final rawField in fieldList) {
+          final field = Map<String, dynamic>.from((rawField as Map));
+          // 为后续 RECB/WECB 计算绝对偏移做准备
+          field["regionName"] = regionName;
+          field["regionSpace"] = regionSpace;
+          field["originOffset"] = originOffset;
+          field["originExpression"] = originExpression;
+          allEcFields.add(field);
+          final n = (field["name"] ?? "").toString().toUpperCase();
+          if (n.isNotEmpty) {
+            ecFieldByName.putIfAbsent(n, () => field);
+          }
+        }
+      }
+    }
+
+    // 收集所有 Mutex 定义，便于在依赖表中记录
+    final mutexByName = <String, Map<String, dynamic>>{};
+    for (final dev in [...batteryDevices, ...ecDevices]) {
+      final mutexs = dev["mutexs"] as List<dynamic>? ?? const [];
+      for (final rawMutex in mutexs) {
+        final n = rawMutex["name"] ?? "";
+        if (n.isEmpty) continue;
+        mutexByName.putIfAbsent(n, () => rawMutex);
+      }
+    }
+
+    // 方法索引：fullPath -> methodMap，name -> [methodMap...]
+    final byFullPath = <String, Map<String, dynamic>>{};
+    final byPathKey = <String, Map<String, dynamic>>{};
+    final byName = <String, List<Map<String, dynamic>>>{};
+
+    void indexMethod(Map<String, dynamic> method) {
+      final rawName = (method["name"] ?? "").toString();
+      final scope = (method["scope"] ?? "").toString();
+      if (rawName.isEmpty || scope.isEmpty) return;
+
+      final name = rawName.toUpperCase();
+      final normalized = Map<String, dynamic>.from(method)
+        ..["name"] = name
+        // Multi-battery SSDT 生成处历史上使用过 path 字段，这里做兼容，不改生成逻辑。
+        ..["path"] = method["path"] ?? scope;
+
+      final fullPath = _methodFullPath(scope, name);
+      byFullPath.putIfAbsent(fullPath, () => normalized);
+      byPathKey.putIfAbsent(
+        BatteryExternalNormalizer.pathKey(fullPath),
+        () => normalized,
+      );
+      final sameName = byName.putIfAbsent(name, () => []);
+      if (!sameName.any(
+        (item) =>
+            BatteryExternalNormalizer.pathKey(
+              _methodFullPath(
+                (item["scope"] ?? "").toString(),
+                (item["name"] ?? "").toString(),
+              ),
+            ) ==
+            BatteryExternalNormalizer.pathKey(fullPath),
+      )) {
+        sameName.add(normalized);
+      }
+    }
+
+    for (final method in _allBatteryNamespaceMethods()) {
+      indexMethod(method);
+    }
+    for (final bat in batteryDevices) {
+      final methods = bat["methods"] as List<dynamic>? ?? const [];
+      for (final m in methods) {
+        indexMethod(m);
+      }
+    }
+    for (final ec in ecDevices) {
+      final methods = ec["methods"] as List<dynamic>? ?? const [];
+      for (final m in methods) {
+        indexMethod(m);
+      }
+    }
+    // 从标准 _BIF/_BIX/_BST 根方法沿调用链传播语义。
+    // 不能按 XBIF、GBIF 等辅助方法名猜测，否则会把字符串槽位当成整数。
+    final semanticsByPath = <String, BatteryMethodSemantics>{};
+    final callsByPath = <String, Set<String>>{};
+    for (final entry in byFullPath.entries) {
+      final method = entry.value;
+      final name = (method["name"] ?? "").toString().toUpperCase();
+      final seed = BatteryMethodSemantics(
+        bif: name == "_BIF",
+        bix: name == "_BIX",
+        bst: name == "_BST",
+      );
+      if (!seed.isEmpty) semanticsByPath[entry.key] = seed;
+      final callees = <String>{};
+      for (final childReference in _extractInvokedMethodReferences(
+        (method["text"] ?? "").toString(),
+      )) {
+        final child = _resolveMethodReference(
+          reference: childReference,
+          callerPath: entry.key,
+          byFullPath: byFullPath,
+          byPathKey: byPathKey,
+          byName: byName,
+        );
+        if (child == null) continue;
+        final childScope = (child["scope"] ?? "").toString();
+        final childSeg = (child["name"] ?? "").toString().toUpperCase();
+        if (childScope.isNotEmpty && childSeg.isNotEmpty) {
+          callees.add(_methodFullPath(childScope, childSeg));
+        }
+      }
+      callsByPath[entry.key] = callees;
+    }
+    var semanticsChanged = true;
+    while (semanticsChanged) {
+      semanticsChanged = false;
+      for (final entry in callsByPath.entries) {
+        final source = semanticsByPath[entry.key];
+        if (source == null || source.isEmpty) continue;
+        for (final callee in entry.value) {
+          final old = semanticsByPath[callee] ?? const BatteryMethodSemantics();
+          final merged = old.merge(source);
+          if (merged.bif != old.bif ||
+              merged.bix != old.bix ||
+              merged.bst != old.bst) {
+            semanticsByPath[callee] = merged;
+            semanticsChanged = true;
+          }
+        }
+      }
+    }
+
+    // Roots: 电池标准方法 + EC 作用域 Notify(BATx, ...) 方法
+    final rootFullPaths = <String>{};
+    for (final bat in batteryDevices) {
+      final scope = (bat["path"] ?? bat["scope"] ?? "").toString();
+      if (scope.isEmpty) continue;
+      final methods = bat["methods"] as List<dynamic>? ?? const [];
+      for (final m in methods) {
+        final name = m["name"] ?? "";
+        if (name.isEmpty) continue;
+        if (!entryMethods.contains(name)) continue;
+        rootFullPaths.add(_methodFullPath(scope, name));
+      }
+    }
+    for (final entry in byFullPath.entries) {
+      final method = entry.value;
+      final text = (method["text"] ?? "").toString();
+      if (_extractBatteryNotifyTargets(text, batteryNames).isNotEmpty) {
+        rootFullPaths.add(entry.key);
+      }
+    }
+
+    final nodeCache = <String, Map<String, dynamic>?>{};
+    Map<String, dynamic>? buildNode(String fullPath, Set<String> stack) {
+      if (nodeCache.containsKey(fullPath)) return nodeCache[fullPath];
+      if (stack.contains(fullPath)) return null;
+      stack.add(fullPath);
+
+      final method = byFullPath[fullPath];
+      if (method == null) {
+        stack.remove(fullPath);
+        nodeCache[fullPath] = null;
+        return null;
+      }
+
+      final name = (method["name"] ?? "").toString().toUpperCase();
+      final text = (method["text"] ?? "").toString();
+      final scope = (method["scope"] ?? "").toString();
+      final argCount = method["argCount"] as int? ?? 0;
+      final flags = (method["flags"] ?? "NotSerialized").toString();
+
+      // Notify(BATx, ...)
+      final notifyTargets = _extractBatteryNotifyTargets(text, batteryNames);
+
+      // 宽字节(>8bit)字段
+      final (hasWideFields, wideFieldNames) = _methodAccessesWideFields(
+        methodText: text,
+        fieldList: allEcFields,
+      );
+      final fields = <Map<String, dynamic>>[];
+      for (final f in wideFieldNames) {
+        final field = ecFieldByName[f.toUpperCase()];
+        if (field != null) {
+          final bitLen = field["bitLength"] as int? ?? 0;
+          final byteLen = field["byteLength"] as int? ?? 0;
+          if (bitLen > 8 || byteLen > 1) {
+            fields.add(field);
+          }
+        }
+      }
+
+      // Mutex 使用情况
+      final mutexs = <Map<String, dynamic>>[];
+      final usedTokens = _extractUsedVariables(text);
+      for (final token in usedTokens) {
+        final hit = mutexByName[token.toUpperCase()];
+        if (hit != null) {
+          mutexs.add(hit);
+        }
+      }
+
+      // 子方法依赖
+      final invoked = _extractInvokedMethodReferences(text).toList()..sort();
+      final children = <Map<String, dynamic>>[];
+      for (final childReference in invoked) {
+        final child = _resolveMethodReference(
+          reference: childReference,
+          callerPath: fullPath,
+          byFullPath: byFullPath,
+          byPathKey: byPathKey,
+          byName: byName,
+        );
+        if (child == null) continue;
+        final childScope = (child["scope"] ?? "").toString();
+        final childSeg = (child["name"] ?? "").toString().toUpperCase();
+        if (childScope.isEmpty || childSeg.isEmpty) continue;
+        final childFull = _methodFullPath(childScope, childSeg);
+        final childNode = buildNode(childFull, stack);
+        if (childNode != null) {
+          children.add(childNode);
+        }
+      }
+
+      // 单电池：仅保留“自身或子链路”访问宽字节的方法；多电池：所有可达方法均保留
+      final include =
+          includeAllReachableMethods || hasWideFields || children.isNotEmpty;
+      if (!include) {
+        stack.remove(fullPath);
+        nodeCache[fullPath] = null;
+        return null;
+      }
+
+      final node = <String, dynamic>{
+        "name": name,
+        "text": text,
+        "type": "MethodObj",
+        "argCount": argCount,
+        "flags": flags,
+        "line": method["line"] ?? 0,
+        "scope": scope,
+        // 兼容历史字段：部分多电池 wrapper 生成逻辑读取 path
+        "path": method["path"] ?? scope,
+        "batteryBif": semanticsByPath[fullPath]?.bif ?? false,
+        "batteryBix": semanticsByPath[fullPath]?.bix ?? false,
+        "batteryBst": semanticsByPath[fullPath]?.bst ?? false,
+        "fields": fields,
+        "mutexs": mutexs,
+        "notifyTargets": (notifyTargets.toList()..sort()),
+        "methods": children,
+      };
+
+      stack.remove(fullPath);
+      nodeCache[fullPath] = node;
+      return node;
+    }
+
+    final depTable = <Map<String, dynamic>>[];
+    final orderedRoots = rootFullPaths.toList()..sort();
+    for (final root in orderedRoots) {
+      final node = buildNode(root, <String>{});
+      if (node != null) depTable.add(node);
+    }
+
+    // 由依赖表T导出：需要重命名/包装的方法集合 + 宽字节字段集合 + Mutex 使用集合
+    final renameMethods = <String, Map<String, dynamic>>{};
+    final wideFields = <String, Map<String, dynamic>>{};
+    final usedMutexNames = <String>{};
+
+    final visited = <String>{};
+    final duplicateRename = <String, Set<String>>{};
+
+    void walk(Map<String, dynamic> node) {
+      final scope = (node["scope"] ?? "").toString();
+      final name = (node["name"] ?? "").toString().toUpperCase();
+      final key = _methodFullPath(scope, name);
+      if (visited.contains(key)) return;
+      visited.add(key);
+
+      // 统计 Mutex
+      final mutexs = node["mutexs"] as List<dynamic>? ?? const [];
+      for (final raw in mutexs) {
+        final mutex = raw;
+        final mName = (mutex["name"] ?? "").toString().toUpperCase();
+        if (mName.isNotEmpty) usedMutexNames.add(mName);
+      }
+
+      // 统计宽字段
+      final fields = node["fields"] as List<dynamic>? ?? const [];
+      for (final raw in fields) {
+        final field = raw;
+        final fName = (field["name"] ?? "").toString().toUpperCase();
+        if (fName.isNotEmpty) {
+          wideFields.putIfAbsent(fName, () => field);
+        }
+      }
+
+      final notifyTargets = node["notifyTargets"] as List<dynamic>? ?? const [];
+      final shouldRename =
+          fields.isNotEmpty ||
+          (includeAllReachableMethods && notifyTargets.isNotEmpty);
+      if (shouldRename) {
+        final existing = renameMethods[name];
+        if (existing == null) {
+          renameMethods[name] = Map<String, dynamic>.from(node)
+            ..["origins"] = <Map<String, dynamic>>[node];
+        } else {
+          final origins = existing["origins"] as List<dynamic>? ?? <dynamic>[];
+          final originKeys = origins
+              .whereType<Map>()
+              .map(
+                (origin) => BatteryExternalNormalizer.pathKey(
+                  _methodFullPath(
+                    (origin["scope"] ?? '').toString(),
+                    (origin["name"] ?? '').toString(),
+                  ),
+                ),
+              )
+              .toSet();
+          if (originKeys.add(BatteryExternalNormalizer.pathKey(key))) {
+            origins.add(node);
+            existing["origins"] = origins;
+          }
+          final exScope = (existing["scope"] ?? "").toString();
+          if (exScope != scope) {
+            duplicateRename.putIfAbsent(name, () => {exScope}).add(scope);
+          }
+        }
+      }
+
+      final children = node["methods"] as List<dynamic>? ?? const [];
+      for (final c in children) {
+        walk(c);
+      }
+    }
+
+    for (final root in depTable) {
+      walk(root);
+    }
+
+    if (duplicateRename.isNotEmpty) {
+      for (final entry in duplicateRename.entries) {
+        final scopes = entry.value.toList()..sort();
+        Log(
+          "=> 检测到同名方法 ${entry.key} 位于多个作用域: ${scopes.join(', ')}；将共享同一 Rename 补丁，并分别生成包装器。",
+        );
+      }
+    }
+
+    final flatTable = _flattenBatteryDependencyTable(depTable);
+    return (flatTable, renameMethods, wideFields, usedMutexNames);
+  }
+
+  /// 递归展开电池依赖表，将所有方法按名称排序
+  List<Map<String, dynamic>> _flattenBatteryDependencyTable(
+    List<Map<String, dynamic>> roots,
+  ) {
+    final tableByName = <String, Map<String, dynamic>>{};
+    final edges = <String, Set<String>>{};
+    final scopesByName = <String, Set<String>>{};
+
+    void mergeFieldList(
+      Map<String, dynamic> entry,
+      String key,
+      List<dynamic> incoming,
+      String nameKey,
+    ) {
+      final existing = entry[key] as List<dynamic>? ?? <dynamic>[];
+      final byName = <String, Map<String, dynamic>>{};
+      for (final raw in existing) {
+        final m = raw;
+        final n = (m[nameKey] ?? "").toString().toUpperCase();
+        if (n.isEmpty) continue;
+        byName.putIfAbsent(n, () => m);
+      }
+      for (final raw in incoming) {
+        final m = raw;
+        final n = (m[nameKey] ?? "").toString().toUpperCase();
+        if (n.isEmpty) continue;
+        byName.putIfAbsent(n, () => m);
+      }
+      final merged = byName.values.toList()
+        ..sort(
+          (a, b) => (a[nameKey] ?? "").toString().compareTo(
+            (b[nameKey] ?? "").toString(),
+          ),
+        );
+      entry[key] = merged;
+    }
+
+    void mergeStringList(
+      Map<String, dynamic> entry,
+      String key,
+      List<dynamic> s,
+    ) {
+      final existing = entry[key] as List<dynamic>? ?? <dynamic>[];
+      final set = <String>{};
+      for (final v in existing) {
+        final x = v.toString().toUpperCase();
+        if (x.isNotEmpty) set.add(x);
+      }
+      for (final v in s) {
+        final x = v.toString().toUpperCase();
+        if (x.isNotEmpty) set.add(x);
+      }
+      final list = set.toList()..sort();
+      entry[key] = list;
+    }
+
+    void visit(Map<String, dynamic> node) {
+      final name = (node["name"] ?? "").toString().toUpperCase();
+      if (name.isEmpty) return;
+
+      final scope = (node["scope"] ?? "").toString();
+      if (scope.isNotEmpty) {
+        scopesByName.putIfAbsent(name, () => <String>{}).add(scope);
+      }
+
+      final entry = tableByName.putIfAbsent(name, () {
+        return <String, dynamic>{
+          "name": name,
+          "text": node["text"] ?? "",
+          "type": node["type"] ?? "MethodObj",
+          "argCount": node["argCount"] ?? 0,
+          "flags": node["flags"] ?? "NotSerialized",
+          "line": node["line"] ?? 0,
+          // Keep the first-seen scope as representative, but also record all scopes.
+          "scope": scope,
+          "path": node["path"] ?? scope,
+          "batteryBif": node["batteryBif"] == true,
+          "batteryBix": node["batteryBix"] == true,
+          "batteryBst": node["batteryBst"] == true,
+          "scopes": <String>[],
+          "fields": <Map<String, dynamic>>[],
+          "mutexs": <Map<String, dynamic>>[],
+          "notifyTargets": <String>[],
+          // Store dependencies as method references to avoid deep/cyclic nesting.
+          "methods": <Map<String, dynamic>>[],
+        };
+      });
+
+      entry["batteryBif"] =
+          entry["batteryBif"] == true || node["batteryBif"] == true;
+      entry["batteryBix"] =
+          entry["batteryBix"] == true || node["batteryBix"] == true;
+      entry["batteryBst"] =
+          entry["batteryBst"] == true || node["batteryBst"] == true;
+
+      // Merge metadata across duplicate NameSeg occurrences.
+      mergeFieldList(
+        entry,
+        "fields",
+        node["fields"] as List<dynamic>? ?? const [],
+        "name",
+      );
+      mergeFieldList(
+        entry,
+        "mutexs",
+        node["mutexs"] as List<dynamic>? ?? const [],
+        "name",
+      );
+      mergeStringList(
+        entry,
+        "notifyTargets",
+        node["notifyTargets"] as List<dynamic>? ?? const [],
+      );
+
+      final children = node["methods"] as List<dynamic>? ?? const [];
+      for (final child in children) {
+        final childName = (child["name"] ?? "").toString().toUpperCase();
+        if (childName.isEmpty) continue;
+        edges.putIfAbsent(name, () => <String>{}).add(childName);
+        visit(child);
+      }
+    }
+
+    for (final root in roots) {
+      visit(root);
+    }
+
+    // Finalize scopes and dependency names.
+    for (final entry in tableByName.values) {
+      final name = (entry["name"] ?? "").toString().toUpperCase();
+      final scopes = (scopesByName[name] ?? <String>{}).toList()..sort();
+      entry["scopes"] = scopes;
+      if ((entry["scope"] ?? "").toString().isEmpty && scopes.isNotEmpty) {
+        entry["scope"] = scopes.first;
+        entry["path"] = scopes.first;
+      }
+      final deps = (edges[name] ?? <String>{}).toList()..sort();
+      entry["methods"] = deps.map((n) => {"name": n}).toList();
+    }
+
+    final list = tableByName.values.toList()
+      ..sort(
+        (a, b) => (a["name"] ?? "").toString().compareTo(
+          (b["name"] ?? "").toString(),
+        ),
+      );
+    return list;
+  }
+
+  /// 日志输出电池依赖表
+  Future<void> _logBatteryDependencyTable(
+    List<Map<String, dynamic>> table,
+  ) async {
+    if (table.isEmpty) {
+      Log("=> 电池依赖表T为空");
+      return;
+    }
+
+    final ordered = List<Map<String, dynamic>>.from(table)
+      ..sort(
+        (a, b) => (a["name"] ?? "").toString().compareTo(
+          (b["name"] ?? "").toString(),
+        ),
+      );
+    final wideCount = ordered.where((n) {
+      final fields = n["fields"] as List<dynamic>? ?? const [];
+      return fields.isNotEmpty;
+    }).length;
+    final notifyCount = ordered.where((n) {
+      final notifyTargets = n["notifyTargets"] as List<dynamic>? ?? const [];
+      return notifyTargets.isNotEmpty;
+    }).length;
+
+    Log(
+      "=> 依赖表T统计: methods=${ordered.length}, wideMethods=$wideCount, notifyMethods=$notifyCount",
+    );
+
+    int printed = 0;
+    const maxLines = 250;
+
+    Log("=> 依赖表T列表:");
+    for (final node in ordered) {
+      if (printed >= maxLines) break;
+
+      final name = (node["name"] ?? "").toString().toUpperCase();
+      final scopes = (node["scopes"] as List<dynamic>? ?? const [])
+          .map((e) => e.toString())
+          .where((e) => e.isNotEmpty)
+          .toList();
+      final fields = node["fields"] as List<dynamic>? ?? const [];
+      final notifyTargets = node["notifyTargets"] as List<dynamic>? ?? const [];
+      final mutexs = node["mutexs"] as List<dynamic>? ?? const [];
+      final deps = node["methods"] as List<dynamic>? ?? const [];
+
+      final tags = <String>[];
+      if (fields.isNotEmpty) {
+        final fieldNames =
+            fields
+                .map((e) => e["name"] ?? "")
+                .where((e) => e.isNotEmpty)
+                .toList()
+              ..sort();
+        tags.add("Wide=${fieldNames.join('+')}");
+      }
+      if (notifyTargets.isNotEmpty) {
+        tags.add("Notify=${notifyTargets.map((e) => e.toString()).join('+')}");
+      }
+      if (mutexs.isNotEmpty) {
+        final names =
+            mutexs
+                .map((e) => e["name"] ?? "")
+                .where((e) => e.isNotEmpty)
+                .toSet()
+                .toList()
+              ..sort();
+        if (names.isNotEmpty) tags.add("Mutex=${names.join('+')}");
+      }
+      if (deps.isNotEmpty) {
+        final depNames =
+            deps
+                .map((e) {
+                  if (e is Map) {
+                    return (e["name"] ?? "").toString().toUpperCase();
+                  }
+                  return e.toString().toUpperCase();
+                })
+                .where((e) => e.isNotEmpty)
+                .toList()
+              ..sort();
+        tags.add("Deps=${depNames.join('+')}");
+      }
+      final scopeText = scopes.isEmpty ? "" : " @${scopes.join('|')}";
+      final suffix = tags.isEmpty ? "" : " (${tags.join(', ')})";
+      Log("  $name$scopeText$suffix");
+      printed++;
+      if (printed % 20 == 0) await Log.yieldToUi();
+    }
+
+    if (printed >= maxLines) {
+      Log.warning("=> 依赖表T输出过长,已截断 (maxLines=$maxLines)");
+    }
+    await Log.yieldToUi();
+  }
+
+  // 检查是否是关键字
+  bool _isKeyword(String word) {
+    final w = word.toUpperCase();
+
+    const keywords = {
+      "IF",
+      "ELSE",
+      "ELSEIF",
+      "WHILE",
+      "RETURN",
+      "STORE",
+      "AND",
+      "PCI0",
+      "LPCB",
+      "CASE",
+      "OR",
+      "XOR",
+      "NOT",
+      "LAND",
+      "LOR",
+      "LNOT",
+      "LEQUAL",
+      "LGREATER",
+      "LLESS",
+      "LGREATEREQUAL",
+      "LLESSEQUAL",
+      "LNOTEQUAL",
+      "ADD",
+      "SUBTRACT",
+      "MULTIPLY",
+      "DIVIDE",
+      "MOD",
+      "SHIFTLEFT",
+      "SHIFTRIGHT",
+      "CONCAT",
+      "MATCH",
+      "INDEX",
+      "DEREFOF",
+      "SIZEOF",
+      "TOSTRING",
+      "TOINTEGER",
+      "TOBUFFER",
+      "TOUUID",
+      "COPYOBJECT",
+      "ACQUIRE",
+      "RELEASE",
+      "SLEEP",
+      "STALL",
+      "NOTIFY",
+      "DEBUG",
+      "ASSERT",
+      "RESET",
+      "NAME",
+      "METHOD",
+      "DEVICE",
+      "SCOPE",
+      "BUFFER",
+      "PACKAGE",
+      "POWERRESOURCE",
+      "PROCESSOR",
+      "THERMALZONE",
+      "TRUE",
+      "FALSE",
+      "ZERO",
+      "ONE",
+      "ONES",
+    };
+
+    if (keywords.contains(w)) return true;
+
+    // Arg0-Arg7
+    if (RegExp(r'^ARG[0-7]$').hasMatch(w)) return true;
+
+    // Local0-Local7
+    if (RegExp(r'^LOCAL[0-7]$').hasMatch(w)) return true;
+
+    return false;
+  }
+
+  /// 标准化符号路径
+  String normalizePath({
+    required String ecPath,
+    required String ecName,
+    required String symbolPath,
+  }) {
+    // 1. 绝对路径直接返回
+    if (symbolPath.startsWith(r'\')) {
+      return symbolPath;
+    }
+
+    // 2. 相对路径处理
+    if (symbolPath.startsWith('^')) {
+      // 去掉所有 ^ 和可能的 "."
+      final cleaned = symbolPath.replaceFirst(RegExp(r'^\^+\.?'), '');
+
+      // 如果是以 EC 开头，避免重复拼接
+      if (cleaned.startsWith('$ecName.')) {
+        return '$ecPath.${cleaned.substring(ecName.length + 1)}';
+      }
+
+      if (cleaned == ecName) {
+        return ecPath;
+      }
+
+      // 其他情况：直接拼到 EC 下
+      return '$ecPath.$cleaned';
+    }
+
+    // 3. 普通相对路径（无 ^）
+    return symbolPath;
+  }
+
+  /// 为电池设备和 EC 设备添加 External 声明
+  List<String> _buildBatteryExternals({
+    required List<Map<String, dynamic>> batteryDevices,
+    required List<Map<String, dynamic>> ecDevices,
+    required List<Map<String, dynamic>> usedFields,
+    required Map<String, Map<String, dynamic>> renameTargets,
+    required List<Map<String, String>> usedSymbols,
+  }) {
+    final externals = <String>{};
+    final List<Map<String, String>> unresovedSymbols = List.from(usedSymbols);
+
+    for (final batteryDevice in batteryDevices) {
+      // 为电池设备本身添加 External 声明
+      externals.add("External (${batteryDevice["path"]}, DeviceObj)");
+      if (batteryDevices.length > 1) {
+        externals.add("External (${batteryDevice["path"]}._HID, IntObj)");
+      }
+      // 为重命名目标添加 External 声明
+      for (final target in renameTargets.keys) {
+        for (final origin in _relatedMethodOrigins(renameTargets[target]!)) {
+          externals.add("External (${origin["scope"]}.$target, MethodObj)");
+        }
+        unresovedSymbols.removeWhere((e) => e["name"] == target);
+      }
+
+      // 为电池设备的方法添加 External 声明
+      for (final method in batteryDevice["methods"]) {
+        final methodName = (method["name"] ?? "").toString().toUpperCase();
+        if (!const {"_STA", "_BST", "_BIF", "_BIX"}.contains(methodName)) {
+          continue;
+        }
+        externals.add(
+          "External (${batteryDevice["path"]}.$methodName, MethodObj)",
+        );
+        unresovedSymbols.removeWhere((e) => e["name"] == methodName);
+      }
+
+      // 为电池设备的 Name 对象添加 External 声明
+      for (final nameObj in batteryDevice["names"]) {
+        if (unresovedSymbols.any((e) => e["name"] == nameObj['name'])) {
+          externals.add(
+            "External (${batteryDevice["path"]}.${nameObj['name']}, ${nameObj["type"]})",
+          );
+          unresovedSymbols.removeWhere((e) => e["name"] == nameObj['name']);
+        }
+      }
+    }
+    // 为 EC 设备的字段添加 External 声明
+    for (final ecInfo in ecDevices) {
+      final ecPath = ecInfo["path"];
+      final ecName = ecInfo["name"] ?? "";
+      // 为 EC 设备本身添加 External 声明
+      externals.add("External ($ecPath, DeviceObj)");
+
+      // 为 EC 设备的 Name 对象添加 External 声明
+      for (final nameObj in ecInfo["names"]) {
+        if (unresovedSymbols.any((e) => e["name"] == nameObj['name'])) {
+          final namePath = nameObj["scope"] ?? "";
+          if (namePath.isEmpty) continue;
+          if (namePath.split(".").last == ecName) {
+            externals.add(
+              "External ($ecPath.${nameObj['name']}, ${nameObj["type"]})",
+            );
+          } else {
+            externals.add("External (${nameObj['name']}, ${nameObj["type"]})");
+          }
+          unresovedSymbols.removeWhere((e) => e["name"] == nameObj['name']);
+        }
+      }
+
+      for (final symbol in usedSymbols) {
+        final symbolType = symbol["type"] ?? "";
+        final symbolName = symbol["name"] ?? "";
+        if (symbolType != "method") continue;
+        final symbolPath = symbol["path"] ?? "";
+        if (symbolPath.isEmpty) continue;
+        final methodPaths = d.getMethodPaths(obj: symbolName);
+        final fullPath = methodPaths.length == 1
+            ? methodPaths.first.first.toString()
+            : normalizePath(
+                ecPath: ecPath,
+                ecName: ecName,
+                symbolPath: symbolPath,
+              );
+        externals.add("External ($fullPath, MethodObj)");
+        unresovedSymbols.removeWhere((e) => e["name"] == symbolName);
+      }
+      // 为 EC 设备的 Method 添加 External 声明
+      for (final method in ecInfo["methods"]) {
+        final methodName = method["name"] as String;
+        if (unresovedSymbols.any((e) => e["name"] == methodName)) {
+          if (usedSymbols.any((e) => e['name'] == methodName)) {
+            final methodPath =
+                usedSymbols.firstWhere((e) => e['name'] == methodName)['path']
+                    as String;
+            if (methodPath.contains(ecName)) {
+              externals.add("External ($ecPath.$methodName, MethodObj)");
+            } else {
+              externals.add("External ($methodName, MethodObj)");
+            }
+          }
+          unresovedSymbols.removeWhere((e) => e["name"] == methodName);
+        }
+      }
+
+      // 为 EC 设备的 FieldUnit 添加 External 声明
+      for (final ecFields in ecInfo["scopeFields"]) {
+        final fields = ecFields["fields"];
+        for (final field in fields) {
+          final bitLen = field["bitLength"] as int? ?? 0;
+          final fieldPath = field["scope"] ?? "";
+          if (fieldPath.isEmpty) continue;
+          final fieldUnitObj = unresovedSymbols.firstWhere(
+            (e) => e["name"] == field["name"],
+            orElse: () => {},
+          );
+          if (fieldUnitObj.isNotEmpty && bitLen <= 8) {
+            final fullPath = normalizePath(
+              ecPath: ecPath,
+              ecName: ecName,
+              symbolPath: fieldUnitObj["path"] as String,
+            );
+            externals.add("External ($fullPath, FieldUnitObj)");
+            unresovedSymbols.removeWhere((e) => e["name"] == field["name"]);
+          }
+        }
+      }
+      // 为 EC 设备的 Mutex 添加 External 声明
+      for (final mutex in ecInfo["mutexs"]) {
+        if (unresovedSymbols.any((e) => e["name"] == mutex["name"])) {
+          externals.add("External ($ecPath.${mutex["name"]}, MutexObj)");
+          unresovedSymbols.removeWhere((e) => e["name"] == mutex["name"]);
+        }
+      }
+    }
+
+    for (final field in usedFields) {
+      unresovedSymbols.removeWhere((e) => e["name"] == field["name"]);
+    }
+
+    for (final symbol in List.from(unresovedSymbols)) {
+      final methodPaths = d.getMethodPaths(obj: symbol["name"]);
+      if (methodPaths.isNotEmpty) {
+        final resolvedPath = methodPaths.length == 1
+            ? methodPaths.first.first.toString()
+            : symbol["path"]!;
+        externals.add("External ($resolvedPath, MethodObj)");
+        unresovedSymbols.removeWhere((e) => e["name"] == symbol["name"]);
+      }
+    }
+
+    // 先以固件真实命名空间解析唯一 NameSeg，再生成绝对路径。
+    // 例如 EC.CLPM、EC.HKEY.MHKQ、BAT1.XQ4C 不能退化为根作用域对象。
+    final objectsByLeaf = <String, List<({String path, String type})>>{};
+    void addObject(String rawPath, String rawType) {
+      final path = BatteryExternalNormalizer.normalizePath(rawPath);
+      final key = BatteryExternalNormalizer.pathKey(path);
+      if (key.isEmpty) return;
+      final leaf = key.split('.').last;
+      final object = (
+        path: path,
+        type: BatteryExternalNormalizer.canonicalObjectType(rawType),
+      );
+      final objects = objectsByLeaf.putIfAbsent(leaf, () => []);
+      if (!objects.any(
+        (item) => BatteryExternalNormalizer.pathKey(item.path) == key,
+      )) {
+        objects.add(object);
+      }
+    }
+
+    void addDeviceObjects(Map<String, dynamic> device) {
+      final devicePath = (device["path"] ?? device["scope"] ?? "").toString();
+      if (devicePath.isEmpty) return;
+      addObject(devicePath, "DeviceObj");
+      for (final raw in device["methods"] as List<dynamic>? ?? const []) {
+        final method = raw as Map;
+        final name = (method["name"] ?? "").toString();
+        final scope = (method["scope"] ?? devicePath).toString();
+        if (name.isNotEmpty) addObject("$scope.$name", "MethodObj");
+      }
+      for (final raw in device["names"] as List<dynamic>? ?? const []) {
+        final name = raw as Map;
+        final segment = (name["name"] ?? "").toString();
+        final scope = (name["scope"] ?? devicePath).toString();
+        if (segment.isNotEmpty) {
+          addObject(
+            "$scope.$segment",
+            (name["type"] ?? "UnknownObj").toString(),
+          );
+        }
+      }
+      for (final raw in device["mutexs"] as List<dynamic>? ?? const []) {
+        final mutex = raw as Map;
+        final name = (mutex["name"] ?? "").toString();
+        final scope = (mutex["scope"] ?? devicePath).toString();
+        if (name.isNotEmpty) addObject("$scope.$name", "MutexObj");
+      }
+      for (final rawBlock
+          in device["scopeFields"] as List<dynamic>? ?? const []) {
+        final block = rawBlock as Map;
+        for (final rawField in block["fields"] as List<dynamic>? ?? const []) {
+          final field = rawField as Map;
+          final name = (field["name"] ?? "").toString();
+          final scope = (field["scope"] ?? devicePath).toString();
+          if (name.isNotEmpty) addObject("$scope.$name", "FieldUnitObj");
+        }
+      }
+    }
+
+    for (final device in [...batteryDevices, ...ecDevices]) {
+      addDeviceObjects(device);
+    }
+    final namespaceByPath = <String, BatteryNamespaceObject>{
+      for (final object in _batteryNamespaceObjects)
+        BatteryExternalNormalizer.pathKey(object.path): object,
+    };
+    final methodPaths = namespaceByPath.entries
+        .where((entry) => entry.value.type == "MethodObj")
+        .map((entry) => entry.key)
+        .toSet();
+    final localLeaves = <String>{};
+    final realRootLeaves = <String>{};
+    for (final object in _batteryNamespaceObjects) {
+      final key = BatteryExternalNormalizer.pathKey(object.path);
+      final separator = key.lastIndexOf('.');
+      if (separator < 0) {
+        if (object.confidence > 1) realRootLeaves.add(key);
+        continue;
+      }
+      final parent = key.substring(0, separator);
+      if (methodPaths.contains(parent)) {
+        localLeaves.add(key.substring(separator + 1));
+        continue;
+      }
+      addObject(object.path, object.type);
+    }
+
+    final externalPath = RegExp(
+      r'^\s*External\s*\(\s*([^,\)]+)',
+      caseSensitive: false,
+    );
+    final resolvedBodyKeys = <String>{};
+    for (final line in _batteryBodyExternals) {
+      final match = externalPath.firstMatch(line);
+      if (match != null) {
+        resolvedBodyKeys.add(
+          BatteryExternalNormalizer.pathKey(match.group(1)!),
+        );
+      }
+    }
+    externals.removeWhere((line) {
+      final match = externalPath.firstMatch(line);
+      if (match == null) return false;
+      final key = BatteryExternalNormalizer.pathKey(match.group(1)!);
+      if (key.contains('.') || resolvedBodyKeys.contains(key)) return false;
+      return resolvedBodyKeys.any((bodyKey) => bodyKey.endsWith('.$key'));
+    });
+    _batteryBodyExternals.forEach(externals.add);
+    externals.removeWhere((line) {
+      final match = externalPath.firstMatch(line);
+      if (match == null) return false;
+      final key = BatteryExternalNormalizer.pathKey(match.group(1)!);
+      return !key.contains('.') &&
+          localLeaves.contains(key) &&
+          !realRootLeaves.contains(key);
+    });
+
+    final concreteObjectsByLeaf = <String, List<BatteryNamespaceObject>>{};
+    for (final object in _batteryNamespaceObjects) {
+      if (object.confidence <= 1) continue;
+      final key = BatteryExternalNormalizer.pathKey(object.path);
+      final separator = key.lastIndexOf('.');
+      if (separator >= 0 && methodPaths.contains(key.substring(0, separator))) {
+        continue;
+      }
+      final leaf = key.split('.').last;
+      final objects = concreteObjectsByLeaf.putIfAbsent(leaf, () => []);
+      if (!objects.any(
+        (item) => BatteryExternalNormalizer.pathKey(item.path) == key,
+      )) {
+        objects.add(object);
+      }
+    }
+
+    final aliases = <String, String>{};
+    final preferredTypes = <String, String>{};
+    for (final entry in objectsByLeaf.entries) {
+      final concrete = concreteObjectsByLeaf[entry.key] ?? const [];
+      String? resolvedPath;
+      String? resolvedType;
+      if (entry.value.length == 1) {
+        resolvedPath = entry.value.single.path;
+        resolvedType = entry.value.single.type;
+      } else if (concrete.length == 1) {
+        resolvedPath = concrete.single.path;
+        resolvedType = concrete.single.type;
+      }
+      if (resolvedPath == null || resolvedType == null) continue;
+      aliases[entry.key] = resolvedPath;
+      preferredTypes[resolvedPath] = resolvedType;
+    }
+
+    final list = BatteryExternalNormalizer.canonicalize(
+      externals,
+      preferredTypes: preferredTypes,
+      pathAliases: aliases,
+    ).toList()..sort();
+    return list;
+  }
+
+  /// 任意长度字节写入寄存器区域
+  String _writeBatteryBufferMethod({
+    bool writeWideField = false,
+    required String regionSpace,
+  }) {
+    if (!writeWideField) {
+      return "";
+    }
+    final memory = regionSpace.toLowerCase() == "systemmemory";
+    final byteMethod = memory ? "WM1B" : "WE1B";
+    final bufferMethod = memory ? "WMCB" : "WECB";
+    final space = memory ? "SystemMemory" : "EmbeddedControl";
+    return """
+      Method ($byteMethod, 2, NotSerialized)
+      {
+          OperationRegion (WREG, $space, Arg0, One)
+          Field (WREG, ByteAcc, NoLock, Preserve)
+          {
+              BYTE,   8
+          }
+
+          BYTE = Arg1
+      }
+
+      Method ($bufferMethod, 3, Serialized)
+      {
+          Arg1 = ((Arg1 + 0x07) >> 0x03)
+          Name (BBUF, Buffer (Arg1){})
+          BBUF = Arg2
+          Arg1 += Arg0
+          Local0 = Zero
+          While ((Arg0 < Arg1))
+          {
+              $byteMethod (Arg0, DerefOf (BBUF [Local0]))
+              Arg0++
+              Local0++
+          }
+      }
+    """;
+  }
+
+  // 读取寄存器区域任意长度字节到 Buffer
+  String _readBatteryBufferMethod({
+    bool hasWideField = false,
+    required String regionSpace,
+  }) {
+    if (!hasWideField) {
+      return "";
+    }
+    final memory = regionSpace.toLowerCase() == "systemmemory";
+    final byteMethod = memory ? "RM1B" : "RE1B";
+    final bufferMethod = memory ? "RMCB" : "RECB";
+    final space = memory ? "SystemMemory" : "EmbeddedControl";
+    return """
+        Method ($byteMethod, 1, NotSerialized)
+        {
+            OperationRegion (RREG, $space, Arg0, One)
+            Field (RREG, ByteAcc, NoLock, Preserve)
+            {
+                BYTE, 8
+            }
+            Return (BYTE)
+        }
+
+        Method ($bufferMethod, 2, Serialized)
+        {
+            Local0 = Arg0
+            Local1 = (Arg1 >> 3)
+
+            Name (BBUF, Buffer (Local1){})
+
+            Local2 = Zero
+            While (Local2 < Local1)
+            {
+                BBUF[Local2] = $byteMethod(Local0)
+                Local0++
+                Local2++
+            }
+
+            Return (BBUF)
+        }
+""";
+  }
+
+  // 拼接任意长度 Buffer 为整数
+  String _bufferToIntegerMethod({bool hasWideField = false}) {
+    if (!hasWideField) {
+      return "";
+    }
+    return """
+        Method (B2IN, 2, NotSerialized)
+        {
+            Local0 = Zero
+            Local1 = Zero
+            While (Local1 < Arg1)
+            {
+                Local0 |= (DerefOf (Arg0 [Local1]) << (Local1 * 0x08))
+                Local1++
+            }
+
+            Return (Local0)
+        }
+""";
+  }
+
+  /// SMBUS
+
   Future<void> ssdtSBUSMCHC({bool prebuilt = false}) async =>
       prebuilt ? await _ssdtSBUSMCHCPrebuilt() : await _ssdtSBUSMCHC();
 
@@ -8166,6 +12219,9 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "SBUSMCHC", 0x00000000)
       throw ArgumentError('Data must be String, List<int> or Uint8List');
     }
 
+    // 空数据保持为空，避免把未配置的匹配条件写成全零字节。
+    if (byteData.isEmpty) return byteData;
+
     // 填充到 padTo 长度
     if (padTo > byteData.length) {
       byteData = [...byteData, ...List.filled(padTo - byteData.length, 0)];
@@ -8185,25 +12241,19 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "SBUSMCHC", 0x00000000)
   }) {
     mode ??= config.acpiMatchMode; // 默认使用 acpiMatchMode
 
-    if (table == null) {
-      mode = ACPIMatchMode.leastStrict;
-    }
-
-    // 定义零字节数组的大小
-    int byteLength = idName == "id" ? 8 : 4;
-    List<int> zero = util.getHexBytes("00" * byteLength);
+    if (table == null) return [];
 
     dynamic rawValue;
 
     switch (mode) {
       case ACPIMatchMode.tableIDsAndLength:
-        rawValue = table?[idName];
+        rawValue = table[idName];
         break;
       case ACPIMatchMode.tableIDsAndLengthAndNormalizeHeaders:
-        rawValue = table?["${idName}_ascii"] ?? table?[idName] ?? zero;
+        rawValue = table["${idName}_ascii"] ?? table[idName];
         break;
       default: // leastStrict / lengthOnly
-        return zero;
+        return [];
     }
 
     if (rawValue is String) {
@@ -8211,7 +12261,7 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "SBUSMCHC", 0x00000000)
     } else if (rawValue is List<int>) {
       return rawValue;
     } else {
-      return zero;
+      return [];
     }
   }
 

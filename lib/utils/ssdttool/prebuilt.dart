@@ -574,18 +574,18 @@ DefinitionBlock ("", "SSDT", 2, "RAPID", "PNLF", 0x00000000)
       {
             Scope ($devName)
             {
-                Device (XNLF)
+                Device (PNLF)
                 {
                     Name (_ADR, Zero)
                 }
 
-                Alias (XNLF, PNLF)
+                Alias (PNLF, XNLF)
             }
       }
 ''';
     }
     ssdt += r'''
-    Device (PNLF)
+    Device (XNLF)
             {
                 Name (_HID, EisaId ("APP0002"))  // _HID: Hardware ID
                 Name (_CID, "backlight")  // _CID: Compatible ID

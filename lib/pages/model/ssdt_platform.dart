@@ -661,6 +661,7 @@ class SsdtPlatform {
   /// ======= 可选的SSDT表-Intel笔记本 =======
   static const optional_sstds_intel_laptop = [
     ACPITable.ssdtSBUSMCHC,
+    ACPITable.ssdtBAT,
     ACPITable.ssdtGPRW,
     ACPITable.ssdtFixShutdown,
     ACPITable.ssdtFACP,
@@ -706,6 +707,7 @@ class SsdtPlatform {
   /// ======= 可选的SSDT表-AMD笔记本 =======
   static const optional_sstds_amd_laptop = [
     ACPITable.ssdtSBUSMCHC,
+    ACPITable.ssdtBAT,
     ACPITable.ssdtGPRW,
     ACPITable.ssdtFixShutdown,
     ACPITable.ssdtFACP,

@@ -1,5 +1,5 @@
-//  update_check.dart 
-//  Created by JeoJay127 
+//  update_check.dart
+//  Created by JeoJay127
 //
 import 'package:flutter/material.dart';
 import 'package:rapidssdt/pages/views/markdown_viewer.dart';
@@ -26,10 +26,10 @@ class UpdateDialog extends StatelessWidget {
       silent: silent,
       onUpdateFound: (ctx, info) {
         if (!context.mounted) return;
-        Log.info(info);
+        Log.debug(info);
         _show(context, ctx);
       },
-      onInfo: (info) => Log.info(info),
+      onInfo: (info) => Log.debug(info),
       onError: (error) => Log.error(error),
     );
   }

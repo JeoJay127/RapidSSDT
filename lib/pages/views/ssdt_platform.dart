@@ -53,7 +53,8 @@ class _SsdtPlatformState extends State<SsdtPlatformWidget> {
   }
 
   bool _isDefaultSelected(SsdtItem item) {
-    return item.isBasic || (platformType == '服务器' && item.isRecommend);
+    return item.isBasic ||
+        (item.isRecommend && (platformType == '服务器' || platformType == '笔记本'));
   }
 
   // 解析平台 SSDT 状态

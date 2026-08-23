@@ -1,15 +1,12 @@
-//  logwidet.dart 
-//  Created by JeoJay127 
-//
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'log.dart';
+import 'log_config.dart';
 
 class LogWidget extends StatefulWidget {
   final List<String>? channels;
   final LogConfig? config;
   final bool allChannel;
-  final bool showChannelTag;
   final Map<String, Color>? channelColors;
 
   const LogWidget({
@@ -17,7 +14,6 @@ class LogWidget extends StatefulWidget {
     this.channels,
     this.config,
     this.allChannel = false,
-    this.showChannelTag = false,
     this.channelColors,
   });
 
@@ -27,8 +23,9 @@ class LogWidget extends StatefulWidget {
 
 class _LogWidgetState extends State<LogWidget> {
   final ScrollController _scrollController = ScrollController();
-  final ValueNotifier<List<String>> _logs = ValueNotifier([]);
+  final List<String> _logs = [];
   final List<StreamSubscription<String>> _subscriptions = [];
+  bool _scrollScheduled = false;
 
   @override
   void initState() {
@@ -46,28 +43,55 @@ class _LogWidgetState extends State<LogWidget> {
   }
 
   void _onNewLogLine(String line) {
+    if (!mounted) return;
+
     final maxLines =
         widget.config?.maxLines ??
-        Log.channels[Log.defaultChannel]!.config.maxLines;
+        Log.channels[Log.defaultChannel]?.config.maxLines ??
+        2000;
 
-    final updated = List<String>.from(_logs.value);
-    if (line.contains('[CLEARED]')) {
-      updated.clear();
-    } else {
-      if (updated.length >= maxLines) updated.removeAt(0);
-      updated.add(line);
-    }
-    _logs.value = updated;
-
-    // 滚动到底部（节流可选）
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scrollController.hasClients) return;
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 200),
-        curve: Curves.linearToEaseOut,
-      );
+    setState(() {
+      if (line.contains('[CLEARED]')) {
+        _logs.clear();
+      } else {
+        _logs.add(line);
+      }
+      final excess = _logs.length - maxLines;
+      if (excess > 0) _logs.removeRange(0, excess);
     });
+
+    _scheduleScrollToBottom();
+  }
+
+  void _scheduleScrollToBottom() {
+    if (_scrollScheduled) return;
+    _scrollScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+  }
+
+  void _scrollToBottom([double? previousMaxExtent]) {
+    if (!mounted || !_scrollController.hasClients) {
+      _scrollScheduled = false;
+      return;
+    }
+
+    final position = _scrollController.position;
+    final maxExtent = position.maxScrollExtent;
+    if ((position.pixels - maxExtent).abs() > 0.5) {
+      _scrollController.jumpTo(maxExtent);
+    }
+
+    final extentIsStable =
+        previousMaxExtent != null &&
+        (previousMaxExtent - maxExtent).abs() <= 0.5;
+    if (extentIsStable && position.extentAfter <= 0.5) {
+      _scrollScheduled = false;
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _scrollToBottom(maxExtent),
+    );
   }
 
   @override
@@ -77,106 +101,124 @@ class _LogWidgetState extends State<LogWidget> {
     }
     _subscriptions.clear();
     _scrollController.dispose();
-    _logs.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<List<String>>(
-      valueListenable: _logs,
-      builder: (_, logs, _) {
-        return Container(
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      constraints: const BoxConstraints(
+        minHeight: 200,
+        minWidth: double.infinity,
+      ),
+      child: SelectionArea(
+        child: ListView.builder(
+          controller: _scrollController,
           padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            border: Border.all(color: Colors.grey),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          constraints: const BoxConstraints(
-            minHeight: 200,
-            minWidth: double.infinity,
-          ),
-          child: SingleChildScrollView(
-            controller: _scrollController,
-            child: SelectableText.rich(
-              TextSpan(
-                children: logs
-                    .map(
-                      (log) => LogTextFormatter.format(
-                        log,
-                        config: widget.config,
-                        channelColors: widget.channelColors,
-                        showChannelTag: widget.showChannelTag,
-                      ),
-                    )
-                    .toList(),
-              ),
+          itemCount: _logs.length,
+          itemBuilder: (context, index) => RichText(
+            text: LogTextFormatter.format(
+              _logs[index],
+              context: context,
+              config: widget.config,
+              channelColors: widget.channelColors,
             ),
+            selectionRegistrar: SelectionContainer.maybeOf(context),
+            selectionColor: DefaultSelectionStyle.of(context).selectionColor,
           ),
-        );
-      },
+        ),
+      ),
     );
   }
 }
 
 class LogTextFormatter {
-  static const _timestampBase =
-      r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?';
-  static final _fullPattern = RegExp('$_timestampBase \\[.*?\\]');
-  static final _timestampPattern = RegExp(_timestampBase);
-  static final _levelPattern = RegExp('(?<=$_timestampBase) \\[.*?\\]');
-  static final _levelExtractor = RegExp(r'\[(INFO|DEBUG|WARNING|ERROR)\]');
+  /// 完整日志匹配
+  /// 2026-02-11 09:20:30.123 [default] [INFO] message
+  static final RegExp _logPattern = RegExp(
+    r'^'
+    r'(?<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+'
+    r'\[(?<channel>[^\]]+)\]\s+'
+    r'\[(?<level>[A-Z]+)\]'
+    r'(?:\s(?<message>[\s\S]*))?'
+    r'$',
+  );
 
   static TextSpan format(
     String logText, {
+    required BuildContext context,
     LogConfig? config,
     Map<String, Color>? channelColors,
-    bool showChannelTag = false,
     double textSize = 11,
   }) {
-    final channelName =
-        RegExp(r'^\[([^\]]+)\]').firstMatch(logText)?.group(1) ??
-        Log.defaultChannel;
+    final match = _logPattern.firstMatch(logText);
 
-    final channelColor =
-        channelColors?[channelName] ?? _getChannelColor(channelName);
-    final levelColor = _getLevelColor(logText);
+    // 如果匹配失败，直接原样输出
+    if (match == null) {
+      return TextSpan(
+        text: logText,
+        style: TextStyle(fontSize: textSize),
+      );
+    }
+
+    final timestamp = match.namedGroup('timestamp') ?? '';
+    final channel = match.namedGroup('channel') ?? Log.defaultChannel;
+    final levelStr = match.namedGroup('level') ?? 'DEBUG';
+    final message = match.namedGroup('message') ?? '';
 
     final logConfig =
         config ??
-        Log.channels[channelName]?.config ??
+        Log.channels[channel]?.config ??
         Log.channels[Log.defaultChannel]!.config;
 
-    // 去掉 channel
-    String processedText = logText.replaceFirst(RegExp(r'^\[[^\]]+\]\s*'), '');
+    final channelColor = channelColors?[channel] ?? _getChannelColor(channel);
 
-    // 按配置裁剪
-    if (!logConfig.includeLogTimestampForUI &&
-        !logConfig.includeLogLevelForUI) {
-      processedText = processedText.replaceFirst(_fullPattern, '');
-    } else if (!logConfig.includeLogTimestampForUI) {
-      processedText = processedText.replaceFirst(_timestampPattern, '');
-    } else if (!logConfig.includeLogLevelForUI) {
-      processedText = processedText.replaceFirst(_levelPattern, '');
-    }
+    final levelColor = _getLevelColor(levelStr, context);
 
-    return TextSpan(
-      children: [
-        if (showChannelTag)
-          TextSpan(
-            text: '[$channelName] ',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              color: channelColor,
-              fontSize: textSize,
-            ),
-          ),
+    final children = <InlineSpan>[];
+
+    // ===== Timestamp =====
+    if (logConfig.includeLogTimestampForUI) {
+      children.add(
         TextSpan(
-          text: '$processedText\n',
+          text: '$timestamp ',
           style: TextStyle(fontSize: textSize, color: levelColor),
         ),
-      ],
+      );
+    }
+    // ===== Channel =====
+    if (logConfig.includeLogChannelForUI) {
+      children.add(
+        TextSpan(
+          text: '[$channel] ',
+          style: TextStyle(fontSize: textSize, color: channelColor),
+        ),
+      );
+    }
+
+    // ===== Level =====
+    if (logConfig.includeLogLevelForUI) {
+      children.add(
+        TextSpan(
+          text: '[$levelStr] ',
+          style: TextStyle(fontSize: textSize, color: levelColor),
+        ),
+      );
+    }
+
+    // ===== Message =====
+    children.add(
+      TextSpan(
+        text: message,
+        style: TextStyle(fontSize: textSize, color: levelColor),
+      ),
     );
+
+    return TextSpan(children: children);
   }
 
   static Color _getChannelColor(String channel) {
@@ -184,17 +226,21 @@ class LogTextFormatter {
     return HSLColor.fromAHSL(1, hash.toDouble(), 0.7, 0.6).toColor();
   }
 
-  static Color? _getLevelColor(String logText) {
-    final match = _levelExtractor.firstMatch(logText);
-    switch (match?.group(1)) {
-      case 'DEBUG':
+  static Color _getLevelColor(String level, BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    switch (level) {
+      case 'INFO':
         return Colors.blue;
+      case 'DEBUG':
+        return isDark ? Colors.white : Colors.black;
       case 'WARNING':
         return Colors.orange;
       case 'ERROR':
         return Colors.red;
+      case 'SUCCESS':
+        return Colors.green;
       default:
-        return null;
+        return Colors.deepPurple;
     }
   }
 }

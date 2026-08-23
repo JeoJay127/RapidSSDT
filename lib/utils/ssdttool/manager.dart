@@ -154,6 +154,10 @@ class ACPIToolManager {
           ({PatchContext? context, Map<String, dynamic>? action}) =>
               ssdt.ssdtSBUSMCHC(prebuilt: _pb(context)),
 
+      ACPITable.ssdtBAT.name:
+          ({PatchContext? context, Map<String, dynamic>? action}) =>
+              ssdt.ssdtBAT(),
+
       ACPITable.ssdtAWAC.name:
           ({PatchContext? context, Map<String, dynamic>? action}) =>
               ssdt.ssdtAWAC(prebuilt: _pb(context)),
@@ -315,7 +319,9 @@ class ACPIToolManager {
         if (dependencySsdtName != null) {
           await _removeSsdtArtifacts(dependencySsdtName, outputFolder);
         }
+        await Log.yieldToUi();
         await executor(context: ctx, action: action);
+        await Log.yieldToUi();
       } catch (e) {
         onError?.call('执行失败: $action, 错误: $e');
       } finally {

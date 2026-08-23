@@ -179,6 +179,17 @@ class ACPITable {
 ''',
   };
 
+  static const ssdtBAT = {
+    'name': 'SSDT-BAT',
+    'remark': '电池热补丁(修复电池不显示等问题)',
+    'note': '''
+• 自动查找电池设备（PNP0C0A）与嵌入式控制器（PNP0C09），分析电池方法的完整依赖关系。
+• 自动修复 EC 中超过 8 位的宽字段读写，并生成所需的字段、方法及 Mutex 重命名补丁。
+• 单电池生成 SSDT-BAT；检测到多电池时生成 SSDT-BATC，并合并电池状态与容量信息。
+• 如果检测到 B1B2/B1B4 方法，说明 ACPI 可能已经应用过同类电池补丁，请重新提取原始 ACPI 表后再操作。
+''',
+  };
+
   static const ssdtIMEI = {
     'name': 'SSDT-IMEI',
     'remark': '修复核显加速失败问题(通常适用于Ivy Bridge和 Sandy Bridge)',

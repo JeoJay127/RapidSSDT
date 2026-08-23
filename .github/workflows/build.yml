@@ -1,0 +1,174 @@
+name: CI - Build & Release
+
+# 仅主分支推送或手动运行
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: RapidSSDT
+
+# 同一分支新任务取消旧任务
+concurrency:
+  group: rapidssdt-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 解析版本并判断是否发布
+  release_gate:
+    name: Check Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 普通代码更新不会重复发布
+      - name: Parse and Compare Versions
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          raw_version=$(awk '/^version:/ {print $2; exit}' pubspec.yaml)
+          [[ "$raw_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9]+)?$ ]] || {
+            echo "::error::无效的 pubspec.yaml 版本：$raw_version"
+            exit 1
+          }
+          current=${raw_version%%+*}
+
+          published=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name' \
+            | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+)(\+[0-9]+)?$/\1/p')
+          previous=$(printf '0.0.0\n%s\n' "$published" | sort -V | tail -1)
+          newest=$(printf '%s\n%s\n' "$previous" "$current" | sort -V | tail -1)
+
+          publish=false
+          [[ "$current" != "$previous" && "$current" == "$newest" ]] && publish=true
+
+          echo "version=$current" >> "$GITHUB_OUTPUT"
+          echo "tag=$current" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          printf '### 版本判断\n- 当前版本：`%s`\n- 已发布版本：`%s`\n- 创建 Release：`%s`\n' \
+            "$current" "$previous" "$publish" >> "$GITHUB_STEP_SUMMARY"
+
+  # 三个平台分别构建一次
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: release_gate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows
+            runner: windows-latest
+            target: windows
+            output: build/windows/x64/runner/Release
+            asset: dist/RapidSSDT-Windows.zip
+          - platform: macOS
+            runner: macos-latest
+            target: macos
+            output: build/macos/Build/Products/Release
+            asset: dist/RapidSSDT-macOS.zip
+          - platform: Linux
+            runner: ubuntu-latest
+            target: linux
+            output: build/linux/x64/release/bundle
+            asset: dist/RapidSSDT-Linux.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 安装桌面构建依赖
+      - name: Install Linux Dependencies
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+
+      - name: Set Up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # 始终构建发布模式
+      - name: Get Dependencies and Build
+        run: |
+          flutter pub get
+          flutter build ${{ matrix.target }} --release
+
+      # 补齐系统运行库
+      - name: Create Windows Package
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          $buildDir = "${{ matrix.output }}"
+          $requiredDlls = "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
+          foreach ($dll in $requiredDlls) {
+            $source = Join-Path "wiki\dll" $dll
+            if (-not (Test-Path $source -PathType Leaf)) {
+              throw "Missing Windows runtime DLL: $source"
+            }
+            Copy-Item $source $buildDir -Force
+          }
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive "$buildDir\*" "${{ matrix.asset }}" -Force
+
+      # 保留应用资源属性
+      - name: Create macOS Package
+        if: matrix.target == 'macos'
+        run: |
+          app=$(find "${{ matrix.output }}" -maxdepth 1 -type d -name '*.app' -print -quit)
+          test -n "$app"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$app" "${{ matrix.asset }}"
+
+      - name: Create Linux Package
+        if: matrix.target == 'linux'
+        run: |
+          mkdir -p dist
+          tar -C "${{ matrix.output }}" -czf "$GITHUB_WORKSPACE/${{ matrix.asset }}" .
+
+      # 始终上传三个平台产物
+      - name: Upload ${{ matrix.platform }} Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.platform }}-${{ needs.release_gate.outputs.version }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # 仅在版本升高后发布
+  release:
+    name: Publish ${{ needs.release_gate.outputs.tag }}
+    if: needs.release_gate.outputs.publish == 'true'
+    needs: [release_gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # 下载并合并构建产物
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.release_gate.outputs.tag }}" dist/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "${{ needs.release_gate.outputs.version }}" \
+            --generate-notes --latest

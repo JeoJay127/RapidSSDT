@@ -32,6 +32,7 @@ class SsdtCategory {
         ACPITable.ssdtBridge,
         ACPITable.ssdtDMAR,
         ACPITable.ssdtSBUSMCHC,
+        ACPITable.ssdtBAT,
         ACPITable.ssdtIMEI,
         ACPITable.ssdtFixShutdown,
         ACPITable.ssdtGPRW,

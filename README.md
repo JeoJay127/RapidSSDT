@@ -221,6 +221,10 @@ Linux版本:
 
   •	修复或重写 APIC 表中的 Processor ID,确保 macOS 能正确识别 CPU 核心数量和编号,避免内核 panic 或核心识别错误。
 
+•  **SSDT-BAT**
+
+  •	电池热补丁(适用于笔记本，修复电池不显示，电池状态异常问题)
+
  •	**SSDT-RTC0-RANGE**
 
   •	启用或仿冒传统RTC计时器,并修复RTC范围(适用于所有原生X99(C612)和X299主板)
@@ -299,4 +303,4 @@ Linux版本:
    
    - [acidanthera](https://github.com/acidanthera) 相关ACPI补丁指南与示例
 
-   - [dortania](https://github.com/dortania) 相关ACPI补丁指南与示例 
+   - [dortania](https://github.com/dortania) 相关ACPI补丁指南与示例

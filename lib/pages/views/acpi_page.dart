@@ -184,10 +184,7 @@ class _AcpiPageState extends State<AcpiPage> {
         spacing: 10,
         children: [
           const Text('日志', style: TextStyle(fontSize: 11)),
-          Flexible(
-            flex: 2,
-            child: LogWidget(showChannelTag: false, allChannel: true),
-          ),
+          Flexible(flex: 2, child: LogWidget(allChannel: true)),
           ValueListenableBuilder<PatchState>(
             valueListenable: patchViewModel.state,
             builder: (context, state, _) {

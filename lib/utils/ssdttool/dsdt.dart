@@ -1,5 +1,5 @@
-//  dsdt.dart 
-//  Created by JeoJay127 
+//  dsdt.dart
+//  Created by JeoJay127
 //
 import 'dart:async';
 import 'dart:convert';
@@ -381,12 +381,18 @@ class DSDT {
   Future<(Map, List)> loadTable(
     String tablePath, {
     List<String> exclude = const [],
+    List<String> externalTables = const [],
+    bool logProgress = true,
   }) async {
     String cwd = Directory.current.path;
     Directory? temp;
     Map<String, Map<String, dynamic>> targetFiles = {};
     final excludeSet = exclude.map((e) => e.toLowerCase()).toSet();
     List<String> failed = [];
+    void progress(String message) {
+      if (logProgress) Log(message);
+    }
+
     try {
       List<String> validFiles = [];
 
@@ -398,7 +404,7 @@ class DSDT {
             .where((item) {
               final name = path.basename(item.path);
               if (excludeSet.contains(name.toLowerCase())) {
-                Log("跳过: $name ,先前已经正确反编译!");
+                progress("跳过: $name ,先前已经正确反编译!");
                 return false;
               }
               return tableIsValid(tablePath, tableName: name);
@@ -435,6 +441,20 @@ class DSDT {
 
       for (var file in validFiles) {
         await File(file).copy(path.join(temp.path, path.basename(file)));
+      }
+      final externalFileNames = <String>[];
+      for (final externalTable in externalTables) {
+        final externalFile = File(externalTable);
+        if (!externalFile.existsSync()) {
+          Log.warning("外部 ACPI 表不存在，已跳过: $externalTable");
+          continue;
+        }
+        final externalName = path.basename(externalTable);
+        final externalTarget = path.join(temp.path, externalName);
+        if (!File(externalTarget).existsSync()) {
+          await externalFile.copy(externalTarget);
+        }
+        externalFileNames.add(externalName);
       }
 
       // 处理有效文件
@@ -488,22 +508,51 @@ class DSDT {
 
       // 反编译 DSDT 和 SSDT 表
       if (dsdtOrSsdt.isNotEmpty) {
-        if (dsdtOrSsdt.length == 1) {
-          Log('正在反编译 ${dsdtOrSsdt.first} 文件...');
+        if (externalFileNames.isNotEmpty) {
+          progress(
+            '正在使用 ${externalFileNames.join(', ')} 作为外部命名空间联合反编译 '
+            '${dsdtOrSsdt.map(path.basename).join(', ')} ...',
+          );
+        } else if (dsdtOrSsdt.length == 1) {
+          progress('正在反编译 ${dsdtOrSsdt.first} 文件...');
         } else {
           if (excludeSet.contains('dsdt.aml')) {
-            Log('正在批量反编译 SSDT.aml 文件...');
+            progress('正在批量反编译 SSDT.aml 文件...');
           } else {
-            Log('正在批量反编译 DSDT.aml 和 SSDT.aml 文件...');
+            progress('正在批量反编译 DSDT.aml 和 SSDT.aml 文件...');
           }
         }
         List<String> failedTemp = [];
-        List<String> args = [acpiTool.iasl, "-da", "-dl", "-l", ...dsdtOrSsdt];
+        List<String> args = externalFileNames.isNotEmpty
+            ? [
+                acpiTool.iasl,
+                "-e",
+                ...externalFileNames,
+                "-dl",
+                "-l",
+                ...dsdtOrSsdt,
+              ]
+            : [acpiTool.iasl, "-da", "-dl", "-l", ...dsdtOrSsdt];
         var result = await r.run([
           {"args": args},
         ]);
 
-        if (result.isNotEmpty && result.last != '0') {
+        if (result.isNotEmpty &&
+            result.last != '0' &&
+            externalFileNames.isNotEmpty) {
+          for (final table in dsdtOrSsdt) {
+            final output = File(
+              path.join(
+                temp.path,
+                targetFiles[path.basename(table)]!['disassembledName'],
+              ),
+            );
+            if (output.existsSync()) output.deleteSync();
+            if (logProgress) {
+              Log.warning('=> ${path.basename(table)} 与外部 ACPI 表联合反编译失败！');
+            }
+          }
+        } else if (result.isNotEmpty && result.last != '0') {
           // 如果第一次反编译失败，重试一次，不带 -da 参数
           args = [acpiTool.iasl, "-dl", "-l", ...dsdtOrSsdt];
           final res = await r.run([
@@ -518,19 +567,19 @@ class DSDT {
               )) {
                 Log.warning('=> ${path.basename(e)} 反编译失败！');
               } else {
-                Log('=> ${path.basename(e)} 反编译成功！');
+                progress('=> ${path.basename(e)} 反编译成功！');
               }
             }
-            Log('');
+            progress('');
           } else {
             for (var e in dsdtOrSsdt) {
-              Log('=> ${path.basename(e)} 反编译成功！');
+              progress('=> ${path.basename(e)} 反编译成功！');
             }
-            Log('');
+            progress('');
           }
         } else {
           for (var e in dsdtOrSsdt) {
-            Log('=> ${path.basename(e)} 反编译成功！');
+            progress('=> ${path.basename(e)} 反编译成功！');
           }
         }
 
@@ -546,31 +595,37 @@ class DSDT {
 
         // 单独反编译失败的.aml 文件
         if (failedTemp.isNotEmpty) {
-          Log('正在单独反编译失败的.aml 文件...');
-          for (var e in failedTemp) {
-            args = [acpiTool.iasl, "-dl", "-l", e];
-            final res = await r.run([
-              {"args": args},
-            ]);
-            if (res.isNotEmpty && res.last == '0') {
-              Log('=> $e 反编译成功！');
-            } else {
-              Log.error('=> $e 反编译失败！');
+          if (externalFileNames.isNotEmpty) {
+            // SSDT 独立反编译会把 DSDT 中的 FieldUnit 等对象误判为 MethodObj，
+            // 产生能够反编译、但无法重新编译的损坏 DSL，因此不能降级重试。
+            failed.addAll(failedTemp);
+          } else {
+            progress('正在单独反编译失败的.aml 文件...');
+            for (var e in failedTemp) {
+              args = [acpiTool.iasl, "-dl", "-l", e];
+              final res = await r.run([
+                {"args": args},
+              ]);
+              if (res.isNotEmpty && res.last == '0') {
+                progress('=> $e 反编译成功！');
+              } else {
+                Log.error('=> $e 反编译失败！');
+              }
+              if (!exists(
+                temp.path,
+                targetFiles[path.basename(e)]!['disassembledName'],
+              )) {
+                failed.add(e);
+              }
             }
-            if (!exists(
-              temp.path,
-              targetFiles[path.basename(e)]!['disassembledName'],
-            )) {
-              failed.add(e);
-            }
+            progress('');
           }
-          Log('');
         }
       }
 
       // 反编译其他.aml文件 (例如 DMAR, APIC)
       if (otherTables.isNotEmpty) {
-        Log('正在反编译其他.aml文件...');
+        progress('正在反编译其他.aml文件...');
         List<String> args = [acpiTool.iasl, "-dl", "-l", ...otherTables];
         final res = await r.run([
           {"args": args},
@@ -578,7 +633,7 @@ class DSDT {
 
         if (res.last == '0') {
           for (var e in otherTables) {
-            Log('=>  ${path.basename(e)} 反编译成功！');
+            progress('=>  ${path.basename(e)} 反编译成功！');
           }
         }
         // 获取反编译名称失败的列表
@@ -592,7 +647,9 @@ class DSDT {
         }
       }
 
-      if (failed.length == targetFiles.length && exclude.isEmpty) {
+      if (logProgress &&
+          failed.length == targetFiles.length &&
+          exclude.isEmpty) {
         Log.error("反编译失败: ${failed.toList()}");
       }
 
@@ -1059,13 +1116,178 @@ class DSDT {
     return minPad ?? ("", "");
   }
 
+  /// 搜集所有可能的包含Notify BATx方法
+  /// [batteryNames] 电池名称列表，例如 ["BAT0", "BAT1"]
+  Map<String, Map<String, dynamic>> collectBatteryNotifyMethods({
+    required List<String> batteryNames,
+    required Map<String, dynamic>? table,
+    bool stripComments = true,
+  }) {
+    table ??= getDsdt();
+    if (table?["lines"] == null) {
+      Log("=> $table: 无效的 table 参数");
+      return {};
+    }
+
+    final List<String> lines = (table?["lines"] as List).cast<String>();
+    final Map<String, Map<String, dynamic>> notifyMethods = {};
+
+    /// Method 定义匹配
+    final methodRegex = RegExp(
+      r'^\s*Method\s*\(\s*([A-Za-z0-9_]+)\s*,\s*(\d+)\s*,\s*([A-Za-z]+)',
+      caseSensitive: false,
+    );
+
+    /// 生成 Notify 正则列表
+    final notifyRegexList = batteryNames.map((batteryName) {
+      return RegExp(
+        r'Notify\s*\(\s*(?:[\\^A-Z0-9_\.]+\.)?' +
+            RegExp.escape(batteryName) +
+            r'\s*,',
+        caseSensitive: false,
+      );
+    }).toList();
+
+    for (int i = 0; i < lines.length; i++) {
+      final match = methodRegex.firstMatch(lines[i]);
+      if (match == null) continue;
+
+      try {
+        /// 提取完整 Method block
+        final methodLines = getScope(
+          startingIndex: i,
+          stripComments: stripComments,
+          table: table,
+        );
+
+        if (methodLines.isEmpty) continue;
+
+        final methodText = methodLines.join('\n');
+
+        /// 检测是否包含 Notify BATx
+        bool hasNotify = false;
+        for (final reg in notifyRegexList) {
+          if (reg.hasMatch(methodText)) {
+            hasNotify = true;
+            break;
+          }
+        }
+
+        if (!hasNotify) continue;
+
+        ///
+        final methodName = match.group(1) ?? "";
+        String methodPath = "";
+        final methodPaths = getMethodPaths(obj: methodName);
+        if (methodPaths.isNotEmpty && methodPaths.first.isNotEmpty) {
+          methodPath = _getParentScope(methodPaths[0][0]);
+        }
+
+        final methodInfo = {
+          "text": methodText,
+          "type": "MethodObj",
+          "name": match.group(1) ?? "",
+          "argCount": int.tryParse(match.group(2) ?? "0") ?? 0,
+          "flags": match.group(3) ?? "NotSerialized",
+          "scope": methodPath,
+          "table": table,
+        };
+
+        notifyMethods[methodInfo["name"] as String] = methodInfo;
+      } catch (e) {
+        Log.warning("collectBatteryNotifyMethods: 解析 Method 失败: $e");
+      }
+    }
+
+    return notifyMethods;
+  }
+
+  String _getParentScope(String path) {
+    final idx = path.lastIndexOf('.');
+    if (idx == -1) return path; // 没有父级
+    return path.substring(0, idx);
+  }
+
+  /// 获取指定 Scope 路径的所有 Scope 块
+  /// [scopePath] 例如 "_SB.PCI0" 或 "PCI0"
+  /// [table] ACPI 表
+  /// [stripComments] 是否去掉注释
+  List<List<String>> getScopesOfPath({
+    required String scopePath,
+    required Map<String, dynamic>? table,
+    bool stripComments = true,
+  }) {
+    table ??= getDsdt();
+    if (table?["lines"] == null) {
+      Log("=> $table getScopesOfPath: 无效的 table 参数");
+      return <List<String>>[];
+    }
+
+    final List<String> lines = (table?["lines"] as List).cast<String>();
+    final List<List<String>> results = [];
+
+    final scopeName = scopePath.split('.').last;
+
+    final RegExp scopeRegex = RegExp(
+      r'^\s*Scope\s*\(\s*([^\)]+)\s*\)',
+      caseSensitive: false,
+    );
+
+    for (int i = 0; i < lines.length; i++) {
+      final match = scopeRegex.firstMatch(lines[i]);
+      if (match == null) continue;
+
+      final foundPath = match.group(1)!.trim();
+
+      bool isMatch = false;
+
+      final target = scopePath.trim();
+      final targetWithSlash = target.startsWith(r'\') ? target : r'\' + target;
+      final targetWithoutSlash = target.startsWith(r'\')
+          ? target.substring(1)
+          : target;
+
+      // 完整路径匹配（兼容 \）
+      if (foundPath.toLowerCase() == targetWithSlash.toLowerCase() ||
+          foundPath.toLowerCase() == targetWithoutSlash.toLowerCase()) {
+        isMatch = true;
+      }
+
+      // 节点匹配
+      if (!scopePath.contains('.')) {
+        final last = foundPath.replaceFirst(RegExp(r'^\\'), '').split('.').last;
+        if (last.toLowerCase() == scopeName.toLowerCase()) {
+          isMatch = true;
+        }
+      }
+
+      if (!isMatch) continue;
+
+      try {
+        final scopeLines = getScope(
+          startingIndex: i,
+          stripComments: stripComments,
+          table: table,
+        );
+
+        if (scopeLines.isNotEmpty) {
+          results.add(scopeLines);
+        }
+      } catch (e) {
+        Log.warning("getScopesOfPath: 提取 Scope 时发生错误: $e");
+      }
+    }
+
+    return results;
+  }
+
   /// 获取某个设备的完整 Scope（设备体内的所有行）
   /// [devicePath] 设备路径，如 "_SB.PC00.XHCI" 或简单设备名 "XHCI"
   /// [table] ACPI 表,可选
   /// [stripComments] 是否去掉注释（默认 true）
   List<String> getScopeOfDevice({
     required String devicePath,
-    Map<String, dynamic>? table,
+    required Map<String, dynamic>? table,
     bool stripComments = true,
   }) {
     table ??= getDsdt();
@@ -1081,72 +1303,83 @@ class DSDT {
       caseSensitive: false,
     );
 
-    // 1) 如果传入的是完整路径（包含点），尝试更精确地匹配：通过查找与该设备名对应的 _ADR / _HID / _UID 等定义来确定正确的 Device 定位行索引
+    // 1) 尝试通过 getPaths 获取设备的精确位置
     int? foundIndex;
+    try {
+      final paths = getPaths(table: table);
+      for (final path in paths) {
+        final pathStr = path[0] as String;
+        final pathType = path[2] as String;
 
-    if (devicePath.contains('.')) {
-      try {
-        // 优先尝试通过已有的路径索引查找
-        final adrPaths = getPathOfType(
-          objType: "Name",
-          obj: "_ADR",
-          table: table,
-        );
-        for (final p in adrPaths) {
-          final path = p[0] as String;
-          if (path.toLowerCase().startsWith('${devicePath.toLowerCase()}.')) {
-            continue;
+        // 检查是否是设备路径，并且路径匹配
+        if (pathType == "Device") {
+          // 检查完整路径匹配
+          if (pathStr.toLowerCase() == devicePath.toLowerCase()) {
+            foundIndex = path[1] as int;
+            break;
           }
 
-          final parent = path.substring(0, path.length - 4);
-          if (parent.toLowerCase() == devicePath.toLowerCase()) {
-            // 使用该 _ADR 所在行作为设备附近定位点，向上回溯寻找 Device (...) 行
-            final adrLineIndex = p[1] as int;
-            // 向上回溯 0..20 行寻找 Device (NAME)
-            for (int i = adrLineIndex; i >= 0 && i >= adrLineIndex - 40; i--) {
-              if (deviceLineRegex.hasMatch(lines[i])) {
-                foundIndex = i;
-                break;
-              }
-            }
-            if (foundIndex != null) break;
+          // 检查设备名匹配（当传入的是简单设备名时）
+          if (!devicePath.contains('.') &&
+              pathStr.split('.').last.toLowerCase() ==
+                  deviceName.toLowerCase()) {
+            foundIndex = path[1] as int;
+            break;
           }
         }
-      } catch (_) {
-        // 忽略错误，走后备方案
       }
+    } catch (e) {
+      Log.warning("getScopeOfDevice: 通过路径查找设备时发生错误: $e");
     }
 
-    // 2) 如果上面没有定位到，使用简单的 Device (<NAME>) 全表查找（找到第一个匹配项）
+    // 2) 如果上面没有定位到，使用简单的 Device (<NAME>) 全表查找
     if (foundIndex == null) {
       for (int i = 0; i < lines.length; i++) {
         if (deviceLineRegex.hasMatch(lines[i])) {
-          // 为尽量减少误判，检查该 Device 所在 Scope 中是否包含 deviceName 的 _ADR 或者常见 Name
-          // 先尝试提取该 Scope（用 d.getScope 若可用）
+          // 验证这是否是我们要找的设备
           try {
             final scopeLines = getScope(
               startingIndex: i,
               stripComments: stripComments,
               table: table,
             );
-            final scopeText = scopeLines.join("\n");
-            // 若传入的是完整路径，优先要求 scope 包含至少一个与该路径最后部分有关的标识（比如 Name (_ADR) 或者 deviceName 本身）
-            if (devicePath.contains('.') == false ||
-                scopeText.toLowerCase().contains(deviceName.toLowerCase()) ||
-                scopeText.toLowerCase().contains("_adr")) {
+
+            // 验证提取的 Scope 是否包含设备相关信息
+            bool isValidScope = false;
+            final scopeText = scopeLines.join("\n").toLowerCase();
+
+            // 检查是否包含设备名或常见标识符
+            if (scopeText.contains(deviceName.toLowerCase()) ||
+                scopeText.contains("_adr") ||
+                scopeText.contains("_hid") ||
+                scopeText.contains("_uid")) {
+              isValidScope = true;
+            }
+
+            // 如果是完整路径，还需要进一步验证
+            if (devicePath.contains('.') && isValidScope) {
+              // 尝试通过路径层次结构验证
+              final pathParts = devicePath.split('.');
+              bool pathMatch = true;
+
+              // 检查 Scope 中是否包含路径中的关键部分
+              for (final part in pathParts) {
+                if (!scopeText.contains(part.toLowerCase())) {
+                  pathMatch = false;
+                  break;
+                }
+              }
+
+              isValidScope = pathMatch;
+            }
+
+            if (isValidScope || !devicePath.contains('.')) {
               foundIndex = i;
               break;
-            } else {
-              // 如果给的是完整路径，检查 scope 中是否有匹配 _ADR 对应的地址行
-              if (devicePath.contains('.')) {
-                // 尝试检查 scope 是否包含 devicePath 的一些线索（例如该 table 中的路径存在）
-                // 省略复杂验证，仍可使用此 scope
-                foundIndex = i;
-                break;
-              }
             }
-          } catch (_) {
-            // 出错则仍可接受此行作为候选
+          } catch (e) {
+            // 出错时仍接受此行作为候选
+            Log.warning("getScopeOfDevice: 验证 Scope 时发生错误: $e");
             foundIndex = i;
             break;
           }
@@ -1159,22 +1392,22 @@ class DSDT {
       return <String>[];
     }
 
-    // 3) 调用 d.getScope 提取完整 Scope
+    // 3) 调用改进的 getScope 提取完整 Scope
     try {
       final scopeLines = getScope(
         startingIndex: foundIndex,
         stripComments: stripComments,
         table: table,
       );
+
       if (scopeLines.isEmpty) {
         Log("=> 找到 Device ($deviceName) 行 (index=$foundIndex)，但无法提取 Scope");
         return <String>[];
       }
 
-      // 确保返回的 scope 属于期望的 device（若传入了完整路径，则尝试做简单验证）
+      // 确保返回的 scope 属于期望的 device
       if (devicePath.contains('.')) {
         final joined = scopeLines.join("\n").toLowerCase();
-        // 若 scope 中没有 ADR、HID 等线索，也可能不是目标实例，但为了兼容性,仍返回
         if (!joined.contains(deviceName.toLowerCase())) {
           Log.warning(
             "=> 提取的 Scope 似乎不包含设备名 $deviceName（devicePath=$devicePath），但仍返回内容。",
@@ -1654,6 +1887,165 @@ class DSDT {
       }
     }
     return devices;
+  }
+
+  /// 获取DSDT根作用域下的所有Field变量
+  /// 整理成一个List列表，每个列表是一个字典元素
+  /// 该字典包含该变量所属Field名，字节长度，位长度，偏移
+  List<Map<String, dynamic>> getRootFieldVariables({
+    Map<String, dynamic>? table,
+  }) {
+    table ??= getDsdt();
+    final List<Map<String, dynamic>> fieldVariables = [];
+    if (!table!.containsKey('lines')) {
+      return fieldVariables;
+    }
+
+    final lines = table['lines'] as List<String>;
+    bool inField = false;
+    String currentFieldName = "";
+    int currentOffset = 0;
+
+    for (final line in lines) {
+      final trimmedLine = line.trim();
+
+      // 检查是否进入Field区域
+      if (trimmedLine.startsWith('Field (')) {
+        inField = true;
+        // 提取Field名称（如果有）
+        final fieldMatch = RegExp(
+          r'Field\s*\(\s*\S+\s*,\s*(\S+)',
+        ).firstMatch(trimmedLine);
+        if (fieldMatch != null) {
+          currentFieldName = fieldMatch.group(1)!;
+        }
+        currentOffset = 0;
+      }
+      // 检查是否退出Field区域
+      else if (inField && trimmedLine == '}') {
+        inField = false;
+        currentFieldName = "";
+      }
+      // 在Field区域内，检查字段定义
+      else if (inField) {
+        // 匹配字段定义，如 "OSYS,   16,"
+        final fieldMatch = RegExp(
+          r'^\s*([A-Z0-9_]+)\s*,\s*(\d+)\s*,?',
+        ).firstMatch(trimmedLine);
+        if (fieldMatch != null) {
+          final fieldName = fieldMatch.group(1)!;
+          final bitLength = int.parse(fieldMatch.group(2)!);
+          final byteLength = (bitLength + 7) ~/ 8;
+
+          fieldVariables.add({
+            "fieldName": currentFieldName,
+            "name": fieldName,
+            "byteLength": byteLength,
+            "bitLength": bitLength,
+            "offset": currentOffset,
+          });
+
+          // 更新偏移量（按位计算）
+          currentOffset += (bitLength + 7) ~/ 8;
+        }
+      }
+    }
+
+    return fieldVariables;
+  }
+
+  /// 检测 Name 对象类型
+  /// [nameText] Name 对象文本（完整 Name(...) 语句，允许多行）
+  String detectNameType(String nameText) {
+    final upper = nameText.toUpperCase();
+
+    // 取逗号后内容
+    final commaIndex = upper.indexOf(',');
+    if (commaIndex == -1) return "UnknownObj";
+
+    final valuePart = upper.substring(commaIndex + 1);
+
+    if (valuePart.contains("PACKAGE")) {
+      return "PkgObj";
+    }
+
+    if (valuePart.contains("BUFFER")) {
+      return "BuffObj";
+    }
+
+    if (valuePart.contains("EISAID")) {
+      return "IntObj";
+    }
+
+    if (RegExp(r'\b(ZERO|ONE|ONES)\b').hasMatch(valuePart)) {
+      return "IntObj";
+    }
+
+    if (RegExp(r'0X[0-9A-F]+|\b\d+\b').hasMatch(valuePart)) {
+      return "IntObj";
+    }
+
+    return "UnknownObj";
+  }
+
+  /// 获取 ACPI 根作用域下的所有 Name 变量及其类型
+  List<Map<String, dynamic>> getRootNameTypeByName({
+    Map<String, dynamic>? table,
+  }) {
+    table ??= getDsdt();
+    final List<Map<String, dynamic>> nameVariables = [];
+    if (table == null || !table.containsKey('lines')) {
+      return nameVariables;
+    }
+
+    final lines = table['lines'] as List<String>;
+
+    for (int i = 0; i < lines.length; i++) {
+      final trimmedLine = lines[i].trim();
+
+      // 完全按 getRootFieldVariables 扫描方式：只要遇到 Name( 开头就采集。
+      if (!trimmedLine.startsWith('Name (')) continue;
+
+      final buffer = StringBuffer();
+      int paren = 0;
+      bool started = false;
+      int t = i;
+
+      for (; t < lines.length; t++) {
+        final current = lines[t];
+        buffer.writeln(current);
+        for (final ch in current.split('')) {
+          if (ch == '(') {
+            paren++;
+            started = true;
+          } else if (ch == ')') {
+            paren--;
+          }
+        }
+        if (started && paren == 0) break;
+      }
+
+      final text = buffer.toString().trim();
+      final match = RegExp(
+        r'^\s*Name\s*\(\s*([A-Za-z0-9_]+)\s*,',
+        caseSensitive: false,
+      ).firstMatch(text);
+      final varName = (match?.group(1) ?? "").trim().toUpperCase();
+      if (varName.isEmpty) {
+        i = t;
+        continue;
+      }
+
+      nameVariables.add({
+        "name": varName,
+        "type": detectNameType(text),
+        "text": text,
+      });
+
+      i = t;
+    }
+
+    return nameVariables;
   }
 
   /// 获取包含指定 CID 的设备路径
