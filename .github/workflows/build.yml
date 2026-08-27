@@ -60,7 +60,7 @@ jobs:
           printf '### 版本判断\n- 当前版本：`%s`\n- 已发布版本：`%s`\n- 创建 Release：`%s`\n' \
             "$current" "$previous" "$publish" >> "$GITHUB_STEP_SUMMARY"
 
-  # 三个平台分别构建一次
+  # 每次推送均构建并上传 Artifact，是否发布 Release 仅由版本判断决定
   build:
     name: Build ${{ matrix.platform }}
     needs: release_gate
@@ -98,6 +98,7 @@ jobs:
       - name: Set Up Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.41.9'
           channel: stable
           cache: true
 
@@ -139,7 +140,7 @@ jobs:
           mkdir -p dist
           tar -C "${{ matrix.output }}" -czf "$GITHUB_WORKSPACE/${{ matrix.asset }}" .
 
-      # 始终上传三个平台产物
+      # 上传三个平台产物
       - name: Upload ${{ matrix.platform }} Artifact
         uses: actions/upload-artifact@v4
         with:
