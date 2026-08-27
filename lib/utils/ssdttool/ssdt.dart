@@ -7339,13 +7339,13 @@ DefinitionBlock("", "SSDT", 2, "RAPID", "PS3", 0)
     // 根据是否存在B1B2电池方法，简单判断是否已经补丁
     final batteryMethodB1B2 = d.getMethodPaths(obj: "B1B2");
     if (batteryMethodB1B2.isNotEmpty) {
-      Log.warning("检测到 B1B2 电池宽字节(超过8字节)读取方法,当前DSDT可能已经打过补丁,请提取原始ACPI表再尝试!");
+      Log.warning("检测到 B1B2 电池宽字节(超过8位)读取方法,当前DSDT可能已经打过补丁,请提取原始ACPI表再尝试!");
       return;
     }
     // 根据是否存在B1B4电池方法，简单判断是否已经补丁
     final batteryMethodB1B4 = d.getMethodPaths(obj: "B1B4");
     if (batteryMethodB1B4.isNotEmpty) {
-      Log.warning("检测到 B1B4 电池宽字节(超过8字节)读取方法,当前DSDT可能已经打过补丁,请提取原始ACPI表再尝试!");
+      Log.warning("检测到 B1B4 电池宽字节(超过8位)读取方法,当前DSDT可能已经打过补丁,请提取原始ACPI表再尝试!");
       return;
     }
 
@@ -7427,7 +7427,7 @@ DefinitionBlock("", "SSDT", 2, "RAPID", "PS3", 0)
     }
 
     if (relatedFields.isNotEmpty) {
-      Log("=> 电池依赖方法中检测到 ${relatedFields.length} 个宽字节(超过8字节)字段:");
+      Log("=> 电池依赖方法中检测到 ${relatedFields.length} 个宽字节(超过8位)字段:");
       for (final field in relatedFields.values) {
         final name = field["name"] as String;
         final bitLen = field["bitLength"] as int;
@@ -7442,7 +7442,7 @@ DefinitionBlock("", "SSDT", 2, "RAPID", "PS3", 0)
         );
       }
     } else {
-      Log("=> 电池依赖方法中未检测到宽字节(超过8字节)字段!");
+      Log("=> 电池依赖方法中未检测到宽字节(超过8位)字段!");
       if (!isMultiBattery) {
         Log("=> 单电池无需热补丁!已终止操作!");
         return;
@@ -9719,8 +9719,8 @@ $elseBranch
     return "$scope.$renameTarget ($args)";
   }
 
-  /// 检查方法体中是否使用了超过8字节的EC字段。
-  /// 如果方法体中使用了超过8字节的字段，则返回true；否则返回false。
+  /// 检查方法体中是否使用了超过8位的EC字段。
+  /// 如果方法体中使用了超过8位的字段，则返回true；否则返回false。
   (bool, Set<String>) _methodAccessesWideFields({
     required String? methodText,
     required List<Map<String, dynamic>> fieldList,
@@ -9730,7 +9730,7 @@ $elseBranch
     // 提取方法体中使用的所有变量名
     final variables = _extractUsedVariables(methodText);
     final wideFields = <String>{};
-    // 检查是否有变量超过8字节
+    // 检查是否有变量超过8位
     for (final variable in variables) {
       final fieldInfo = fieldList.firstWhere(
         (field) =>
